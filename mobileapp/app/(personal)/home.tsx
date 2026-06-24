@@ -15,7 +15,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { useRouter } from "expo-router";
 import { COLORS } from "../../src/constants/colors";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { likePayment, unlikePayment } from "../../src/services/socialService";
+import { likePayment, unlikePayment, fetchFeed } from "../../src/services/socialService";
 
 interface FeedItem {
   id: string;
@@ -93,48 +93,35 @@ export default function HomeScreen() {
     { id: string; user: string; text: string; time: string }[]
   >([]);
 
-  // Load new transfers from AsyncStorage to make it dynamic
+  const FEED_CACHE_KEY = "feed_items_cache";
+
+  // On mount: hydrate UI from cache instantly, then fetch fresh data and overwrite cache
   useEffect(() => {
-    const loadNewTransfers = async () => {
+    const loadFeed = async () => {
+      // Step 1: Load cached feed so content is visible immediately
       try {
-        const stored = await AsyncStorage.getItem("pending_transfers");
-        if (stored) {
-          const transfers = JSON.parse(stored);
-          const formatted: FeedItem[] = transfers.map(
-            (tx: any, idx: number) => ({
-              id: `stored_${idx}`,
-              sender: "Me",
-              receiver: tx.recipient,
-              amount: `₦${tx.amount}`,
-              description: tx.description || "Sent payment",
-              timestamp: "Just now",
-              likes: 0,
-              comments: 0,
-              hasLiked: false,
-              visibility: tx.visibility || "PUBLIC",
-            })
-          );
-
-          // Filter private out of public feed
-          setFeed([...formatted, ...INITIAL_FEED]);
-
-          // Deduct from balance
-          const totalDeducted = transfers.reduce(
-            (acc: number, item: any) =>
-              acc + parseFloat(item.amount.replace(/,/g, "")),
-            0
-          );
-          if (totalDeducted > 0) {
-            setBalance(
-              `₦${(32450 - totalDeducted).toLocaleString("en-US", { minimumFractionDigits: 2 })}`
-            );
-          }
+        const cached = await AsyncStorage.getItem(FEED_CACHE_KEY);
+        if (cached !== null) {
+          const cachedFeed: FeedItem[] = JSON.parse(cached);
+          setFeed(cachedFeed);
         }
-      } catch (e) {
-        console.error(e);
+      } catch {
+        // Cache unreadable (corrupt JSON, etc.) — INITIAL_FEED remains in state
+      }
+
+      // Step 2: Fetch fresh data from backend, update state, overwrite cache
+      try {
+        const fresh = await fetchFeed();
+        if (fresh && fresh.length > 0) {
+          setFeed(fresh);
+          await AsyncStorage.setItem(FEED_CACHE_KEY, JSON.stringify(fresh));
+        }
+      } catch {
+        // Network/server failure — cached or initial data stays visible
       }
     };
-    loadNewTransfers();
+
+    loadFeed();
   }, []);
 
   const handleLike = async (id: string) => {
