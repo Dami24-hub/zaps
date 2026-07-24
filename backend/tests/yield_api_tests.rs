@@ -19,17 +19,24 @@ use tower::ServiceExt; // for `oneshot`
 use uuid::Uuid;
 
 // Re-exported from crate.
-use zaps_backend::api::feed::AuthUser;
-
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 async fn test_pool() -> PgPool {
     let url = std::env::var("TEST_DATABASE_URL")
         .or_else(|_| std::env::var("DATABASE_URL"))
         .expect("Set TEST_DATABASE_URL or DATABASE_URL to run integration tests");
-    PgPool::connect(&url)
+    let pool = PgPool::connect(&url)
         .await
-        .expect("Failed to connect to test database")
+        .expect("Failed to connect to test database");
+    zaps_backend::db::run_migrations(&pool)
+        .await
+        .expect("Failed to apply test database migrations");
+    pool
+}
+
+fn test_address(prefix: &str, run: &str) -> String {
+    let padding = 56 - prefix.len() - run.len();
+    format!("{prefix}{run}{}", "X".repeat(padding))
 }
 
 fn yield_router(pool: PgPool) -> Router {
@@ -48,7 +55,10 @@ async fn seed_user(pool: &PgPool, address: &str) -> Uuid {
         "#,
     )
     .bind(address)
-    .bind(format!("user_{}", &address[1..std::cmp::min(10, address.len())]))
+    .bind(format!(
+        "user_{}",
+        &address[1..std::cmp::min(10, address.len())]
+    ))
     .fetch_one(pool)
     .await
     .expect("Failed to seed user")
@@ -95,13 +105,13 @@ async fn test_yield_endpoints_require_auth() {
     let router = yield_router(pool);
 
     // Missing auth header
-    for path in [
-        "/balance",
-        "/history?limit=1&offset=0",
-    ]
-    {
+    for path in ["/balance", "/history?limit=1&offset=0"] {
         let (status, _) = response_json(&router, get_req(path, None)).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} must be 401 without auth");
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{path} must be 401 without auth"
+        );
     }
 
     // Missing auth header for POST
@@ -112,7 +122,11 @@ async fn test_yield_endpoints_require_auth() {
     ] {
         let req = post_req_json(path, None, payload);
         let (status, _) = response_json(&router, req).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} must be 401 without auth");
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{path} must be 401 without auth"
+        );
     }
 }
 
@@ -126,10 +140,7 @@ async fn test_yield_balance_history_toggle() {
 
     // This address string is what the AuthUser extractor maps from JWT `sub`.
     // It may not be a real Stellar address; the extractor only uses it as an opaque key.
-    let address = format!(
-        "GTESTYIELDUSER{}XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
-        run
-    );
+    let address = test_address("GTESTYIELDUSER", &run);
     let user_id = seed_user(&pool, &address).await;
 
     // Token mapping:
@@ -142,16 +153,30 @@ async fn test_yield_balance_history_toggle() {
     assert_eq!(status, StatusCode::OK);
 
     // Validate shape & defaults.
-    assert!(body.get("available_balance").is_some(), "available_balance missing");
-    assert!(body.get("earning_balance").is_some(), "earning_balance missing");
-    assert!(body.get("accrued_interest").is_some(), "accrued_interest missing");
-    assert!(body.get("total_earning_balance").is_some(), "total_earning_balance missing");
+    assert!(
+        body.get("available_balance").is_some(),
+        "available_balance missing"
+    );
+    assert!(
+        body.get("earning_balance").is_some(),
+        "earning_balance missing"
+    );
+    assert!(
+        body.get("accrued_interest").is_some(),
+        "accrued_interest missing"
+    );
+    assert!(
+        body.get("total_earning_balance").is_some(),
+        "total_earning_balance missing"
+    );
     assert!(body.get("apy").is_some(), "apy missing");
 
     // auto_earn_enabled default comes from `users.auto_earn_enabled`.
-    assert_eq!(
-        body.get("auto_earn_enabled").and_then(|v| v.as_bool()).unwrap_or(true),
-        false,
+    assert!(
+        !body
+            .get("auto_earn_enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true),
         "auto_earn_enabled should default to false"
     );
 
@@ -206,18 +231,18 @@ async fn test_yield_balance_history_toggle() {
     }
 
     // 3) GET /api/yield/history
-    let (hist_status, hist_body) = response_json(
-        &router,
-        get_req("/history?limit=10&offset=0", Some(&token)),
-    )
-    .await;
+    let (hist_status, hist_body) =
+        response_json(&router, get_req("/history?limit=10&offset=0", Some(&token))).await;
     assert_eq!(hist_status, StatusCode::OK);
 
     let items = hist_body
         .get("items")
         .and_then(|v| v.as_array())
         .expect("history items must be array");
-    assert!(!items.is_empty(), "expected at least one yield history item");
+    assert!(
+        !items.is_empty(),
+        "expected at least one yield history item"
+    );
 
     // Validate item fields exist.
     let first = &items[0];
@@ -279,8 +304,4 @@ async fn test_yield_balance_history_toggle() {
         .execute(&pool)
         .await
         .ok();
-
-    // Avoid unused import warning.
-    let _ = AuthUser;
 }
-
