@@ -173,12 +173,11 @@ async fn test_yield_balance_history_toggle() {
 
     // auto_earn_enabled default comes from `users.auto_earn_enabled`.
     assert!(
-        !body
-            .get("auto_earn_enabled")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true),
-        "auto_earn_enabled should default to false"
-    );
+    !body.get("auto_earn_enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true),
+    "auto_earn_enabled should default to false"
+);
 
     // 2) Seed at least one yield history transaction by POST /deposit.
     let deposit_payload = serde_json::json!({ "amount": 5000 });
@@ -304,4 +303,11 @@ async fn test_yield_balance_history_toggle() {
         .execute(&pool)
         .await
         .ok();
+
+    // Avoid unused import warning.
+ let _ = AuthUser {
+    id: Uuid::nil(),
+    address: "".to_string(),
+    username: "".to_string(),
+};
 }
