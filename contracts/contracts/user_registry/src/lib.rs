@@ -14,6 +14,7 @@ pub enum DataKey {
     PrivyDid(String),   // Maps Privy DID -> wallet Address
     WalletDid(Address), // Maps wallet Address -> Privy DID (reverse index)
     Admin,              // Stores the contract admin Address
+  
 }
 
 #[contractimpl]
