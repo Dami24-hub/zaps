@@ -172,6 +172,9 @@ impl UserRegistryContract {
 }
 
 #[cfg(test)]
+mod test;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
