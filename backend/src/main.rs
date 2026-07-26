@@ -196,6 +196,25 @@ async fn main() {
         }
     };
 
+    // #544: Redis-backed username->address cache, shared REDIS_URL with the
+    // yield cache above. Absent/unusable REDIS_URL simply falls through to
+    // Postgres on every username resolution.
+    let username_address_cache = match config.redis_url.as_deref() {
+        Some(url) => match services::redis_cache::UsernameAddressCache::connect(url) {
+            Ok(cache) => {
+                tracing::info!("Username->address cache enabled against Redis");
+                Some(cache)
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to initialize username->address cache, continuing without it: {e}"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
     // Bridge state: shares the DB pool and the Allbridge API client.
     let bridge_state =
         api::bridge::BridgeState::new(pool.clone(), config.allbridge_api_url.clone());
@@ -213,11 +232,13 @@ async fn main() {
 
     let sensitive_routes = Router::new()
         .nest("/api/auth", api::auth_routes(pool.clone()))
-        .nest("/api/users", api::user_routes(pool.clone()))
-        // #543: payout constructs a real payment transaction envelope, so it
-        // gets the same rate-limiting as auth/users rather than sitting in
-        // other_routes.
-        .nest("/api/payout", api::payout_routes(pool.clone()));
+        .nest(
+            "/api/users",
+            api::user_routes_with_state(api::user::UserState::new(
+                pool.clone(),
+                username_address_cache.clone(),
+            )),
+        );
 
     let other_routes = Router::new()
         .nest("/api/feed", api::feed_routes(pool.clone()))
