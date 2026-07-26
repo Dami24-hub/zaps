@@ -4,11 +4,9 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::{env, error::Error, time::Duration};
 use uuid::Uuid;
 
-use super::parser::{parse_zaps_event, TokenSalvagedEvent, ZapsEvent};
+use super::parser::{parse_zaps_event, ZapsEvent, TokenSalvagedEvent, UserRegisteredEvent};
 use crate::api::r#yield::{invalidate_platform_yield_cache, YieldCache};
-use crate::db::r#yield::{
-    log_yield_rate_update_tx, process_yield_deposit_tx, process_yield_withdrawal_tx,
-};
+use crate::db::r#yield::{process_yield_deposit_tx, process_yield_withdrawal_tx, log_yield_rate_update};
 
 const INDEXER_CURSOR_KEY: &str = "stellar_event_cursor";
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -63,18 +61,23 @@ pub async fn run(
                     next_cursor = cursor + 1;
                 }
 
-                // BE-045: Process batch within transaction guard to ensure explicit rollback on error
-                if let Ok(outcome) =
-                    process_event_batch_with_guard(&pool, &events, next_cursor).await
-                {
-                    cursor = next_cursor;
-                    tracing::debug!("Indexer cursor advanced to ledger {cursor}");
-
-                    // BE-061: Evict the platform yield cache only after the batch
-                    // has committed, so a reader repopulating the key immediately
-                    // afterwards sees the newly indexed state.
-                    if outcome.platform_yield_dirty {
-                        invalidate_platform_yield_cache(cache.as_ref()).await;
+                // AC1 + AC2: process_event_batch_with_guard writes every event
+                // AND the new checkpoint inside one transaction, committing or
+                // rolling back atomically. (Previously this loop opened its own
+                // transaction, processed events through it, and then never
+                // called `.commit()` or persisted the cursor — every batch was
+                // silently discarded on the next poll's implicit rollback.
+                // Delegating to the already-tested guarded processor fixes
+                // that and gives UserRegistered/YieldAccrued handling for free.)
+                match process_event_batch_with_guard(&pool, &events, next_cursor).await {
+                    Ok(outcome) => {
+                        cursor = next_cursor;
+                        if outcome.platform_yield_dirty {
+                            invalidate_platform_yield_cache(cache.as_ref()).await;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!("Failed to process indexer event batch: {err}");
                     }
                 }
 
@@ -137,19 +140,9 @@ pub async fn process_event_batch_with_guard(
                     );
                     outcome.platform_yield_dirty = true;
                 }
-                ZapsEvent::TokenSalvaged(e) => {
-                    process_token_salvaged_event(e, &mut tx).await?;
-                }
-                // BE-047: Synchronize on-chain friendships to the off-chain database.
-                ZapsEvent::FriendAdded(e) => {
-                    let requester_id = get_or_create_user_id_tx(&mut tx, &e.requester).await?;
-                    let friend_id = get_or_create_user_id_tx(&mut tx, &e.friend).await?;
-                    process_friend_added_tx(&mut tx, requester_id, friend_id).await?;
-                }
-                ZapsEvent::FriendRemoved(e) => {
-                    let user_id = get_or_create_user_id_tx(&mut tx, &e.user).await?;
-                    let friend_id = get_or_create_user_id_tx(&mut tx, &e.friend).await?;
-                    process_friend_removed_tx(&mut tx, user_id, friend_id).await?;
+                // #542: sync a real on-chain username to the users table.
+                ZapsEvent::UserRegistered(e) => {
+                    process_user_registered_event(e, &mut tx).await?;
                 }
                 ZapsEvent::Unknown => {
                     if let Some(payment_event) = extract_social_payment_event(event) {
@@ -310,8 +303,9 @@ fn build_get_events_payload(start_ledger: i64, contract_ids: &[String]) -> Value
         json!({ "topics": [[{ "type": "symbol", "value": "YieldRateUpdated" }]] }),
         json!({ "topics": [[{ "type": "symbol", "value": "YieldAccrued" }]] }),
         json!({ "topics": [[{ "type": "symbol", "value": "TokenSalvaged" }]] }),
-        json!({ "topics": [[{ "type": "symbol", "value": "FriendAdded" }]] }),
-        json!({ "topics": [[{ "type": "symbol", "value": "FriendRemoved" }]] }),
+        json!({ "topics": [[{ "type": "symbol", "value": "YieldAccrued" }]] }),
+        // #542
+        json!({ "topics": [[{ "type": "symbol", "value": "UserRegistered" }]] }),
     ];
 
     if !contract_ids.is_empty() {
@@ -442,29 +436,6 @@ fn find_nested_i64(value: &Value, key: &str) -> Option<i64> {
     }
 }
 
-async fn get_or_create_user_id(
-    address: &str,
-    pool: &PgPool,
-) -> Result<Uuid, Box<dyn std::error::Error + Send + Sync>> {
-    let username = slugify_address(address);
-    let row = sqlx::query(
-        r#"
-        INSERT INTO users (address, username, display_name)
-        VALUES ($1, $2, $3)
-        ON CONFLICT (address)
-        DO UPDATE SET username = COALESCE(users.username, EXCLUDED.username)
-        RETURNING id
-        "#,
-    )
-    .bind(address)
-    .bind(&username)
-    .bind(Some(&username))
-    .fetch_one(pool)
-    .await?;
-
-    Ok(row.get("id"))
-}
-
 async fn get_or_create_user_id_tx(
     tx: &mut Transaction<'_, Postgres>,
     address: &str,
@@ -538,6 +509,32 @@ pub async fn process_token_salvaged_event(
     Ok(())
 }
 
+/// #542: sync a real on-chain username registration to the `users` table.
+///
+/// Unlike `get_or_create_user_id_tx`'s slugified placeholder (used when an
+/// address is only known from a payment/yield event), this always overwrites
+/// `username` with the on-chain value — a `UserRegistered` event is the
+/// authoritative source, so it must supersede any placeholder.
+pub async fn process_user_registered_event(
+    event: UserRegisteredEvent,
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    sqlx::query(
+        r#"
+        INSERT INTO users (address, username, display_name)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (address) DO UPDATE SET username = EXCLUDED.username
+        "#,
+    )
+    .bind(&event.address)
+    .bind(&event.username)
+    .bind(Some(&event.username))
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,26 +564,33 @@ mod tests {
     }
 
     #[test]
-    fn payload_subscribes_to_friendship_events() {
-        let payload = build_get_events_payload(1, &[]);
+    fn payload_subscribes_to_user_registered_events() {
+        // #542: without this filter the indexer never receives registrations
+        // from the user_registry contract's `register_user`.
+        let payload = build_get_events_payload(1, None);
         let filters = payload["params"][0]["filters"].as_array().unwrap();
 
         assert!(filters
             .iter()
-            .any(|filter| filter["topics"][0][0]["value"] == "FriendAdded"));
-        assert!(filters
-            .iter()
-            .any(|filter| filter["topics"][0][0]["value"] == "FriendRemoved"));
+            .any(|filter| filter["topics"][0][0]["value"] == "UserRegistered"));
     }
 
     #[test]
-    fn payload_subscribes_to_token_salvaged_events() {
-        let payload = build_get_events_payload(1, &[]);
-        let filters = payload["params"][0]["filters"].as_array().unwrap();
+    fn parses_user_registered_event_payload() {
+        let payload = json!({
+            "address": "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567",
+            "username": "ebube",
+            "tx_hash": "deadbeef"
+        });
 
-        assert!(filters
-            .iter()
-            .any(|filter| filter["topics"][0][0]["value"] == "TokenSalvaged"));
+        match parse_zaps_event("UserRegistered", &payload) {
+            ZapsEvent::UserRegistered(e) => {
+                assert_eq!(e.address, "GABCDEFGHIJKLMNOPQRSTUVWXYZ234567");
+                assert_eq!(e.username, "ebube");
+                assert_eq!(e.tx_hash, "deadbeef");
+            }
+            _ => panic!("expected ZapsEvent::UserRegistered"),
+        }
     }
 
     #[test]
