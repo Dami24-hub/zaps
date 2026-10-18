@@ -31,6 +31,7 @@ import Svg, {
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
+import * as Notifications from "expo-notifications";
 import { useRouter } from "expo-router";
 import { COLORS } from "../../src/constants/colors";
 import AsyncStorage from "@react-native-async-storage/async-storage";
@@ -38,8 +39,22 @@ import {
   likePayment,
   unlikePayment,
   fetchFeed,
+  addComment,
 } from "../../src/services/socialService";
 import { fetchYieldBalance, updateAutoEarn } from "../../src/services/api";
+import {
+  BalanceCurrency,
+  formatBalance,
+  formatFiatBalance,
+  fiatFromTokens,
+} from "../../src/utils/balanceDisplay";
+import {
+  markNotificationPromptDismissed,
+  registerForPushNotificationsAsync,
+  requestNotificationPermissionsAsync,
+  saveNotificationPreference,
+  shouldShowNotificationConsentPrompt,
+} from "../../src/services/notificationService";
 
 interface FeedItem {
   id: string;
@@ -130,8 +145,10 @@ export default function HomeScreen() {
   const router = useRouter();
   const [activeTab, setActiveTab] = useState<"public" | "friends">("public");
   const [feed, setFeed] = useState<FeedItem[]>(INITIAL_FEED);
-  const [availableBalance, setAvailableBalance] = useState("₦0.00");
-  const [totalYieldEarned, setTotalYieldEarned] = useState("₦0.00");
+  const [availableBalanceXlm, setAvailableBalanceXlm] = useState(0);
+  const [totalYieldEarnedXlm, setTotalYieldEarnedXlm] = useState(0);
+  const [displayCurrency, setDisplayCurrency] =
+    useState<BalanceCurrency>("NGN");
   const [yieldData, setYieldData] = useState<YieldSnapshot | null>(null);
   const [yieldStatus, setYieldStatus] = useState<
     "loading" | "success" | "error"
@@ -148,6 +165,10 @@ export default function HomeScreen() {
   const [autoEarnTooltipVisible, setAutoEarnTooltipVisible] = useState(false);
   const [autoEarnDescModalVisible, setAutoEarnDescModalVisible] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
+  const [notifPromptVisible, setNotifPromptVisible] = useState(false);
+  const [notifRequesting, setNotifRequesting] = useState(false);
+  const [balanceMasked, setBalanceMasked] = useState(true);
+  const MASKED_BALANCE = "••••••";
   const earningsSheetTranslateY = useRef(new Animated.Value(48)).current;
   const earningsBackdropOpacity = useRef(new Animated.Value(0)).current;
   const shimmerAnim = useRef(new Animated.Value(-1)).current;
@@ -172,33 +193,32 @@ export default function HomeScreen() {
   const [commentsList, setCommentsList] = useState<Comment[]>([]);
 
   const FEED_CACHE_KEY = "feed_items_cache";
+  const HOME_CURRENCY_PREF_KEY = "home_display_currency";
   const YIELD_REQUEST_TIMEOUT_MS = 4500;
 
   const fetchYieldSnapshot = async (): Promise<YieldSnapshot> => {
     const data = await fetchYieldBalance();
     setAutoYieldEnabled(data.autoEarnEnabled);
-    
-    const formatCurr = (val: number) =>
-      `₦${val.toLocaleString("en-NG", {
-        minimumFractionDigits: 2,
-        maximumFractionDigits: 2,
-      })}`;
 
-    // Parse numbers formatting correctly
-    const parseAPIValue = (val: string | number) => {
-      if (typeof val === "number") return formatCurr(val);
-      const strVal = String(val);
-      if (strVal.includes("₦")) return strVal;
-      const parsed = Number(strVal);
-      return isNaN(parsed) ? strVal : formatCurr(parsed);
+    // Balances are XLM token amounts; NGN is derived by multiplying by the
+    // configured rate, so keep the raw token figure around to redraw the card
+    // in either denomination when the toggle flips.
+    const parseRawBalance = (val: string | number): number => {
+      if (typeof val === "number") return val;
+      const sanitized = String(val).replace(/[^\d.-]/g, "");
+      const parsed = Number(sanitized);
+      return Number.isFinite(parsed) ? parsed : 0;
     };
 
-    const formattedYield = parseAPIValue(data.totalYieldEarned);
-    const formattedAvailable = parseAPIValue(data.availableBalance);
-    
-    setAvailableBalance(formattedAvailable);
-    setTotalYieldEarned(formattedYield);
-    
+    const availableXlm = parseRawBalance(data.availableBalance);
+    const yieldXlm = parseRawBalance(data.totalYieldEarned);
+
+    setAvailableBalanceXlm(availableXlm);
+    setTotalYieldEarnedXlm(yieldXlm);
+
+    // Yield analytics (monthly chart, compounding projection) stay in Naira.
+    const formattedYield = formatFiatBalance(fiatFromTokens(yieldXlm));
+
     return {
       apy: typeof data.apy === "number" ? `${data.apy}%` : String(data.apy).includes("%") ? String(data.apy) : `${data.apy}%`,
       totalYieldEarned: formattedYield,
@@ -242,6 +262,41 @@ export default function HomeScreen() {
     }
   }, []);
 
+  // Balance figures derived from the raw XLM tokens, redrawn in the active
+  // denomination the moment the currency preference changes.
+  const availableBalanceDisplay = useMemo(
+    () => formatBalance(availableBalanceXlm, displayCurrency),
+    [availableBalanceXlm, displayCurrency]
+  );
+  const totalYieldEarnedDisplay = useMemo(
+    () => formatBalance(totalYieldEarnedXlm, displayCurrency),
+    [totalYieldEarnedXlm, displayCurrency]
+  );
+
+  const toggleCurrency = useCallback(() => {
+    void Haptics.selectionAsync().catch(() => undefined);
+    setDisplayCurrency((prev) => {
+      const next = prev === "NGN" ? "XLM" : "NGN";
+      AsyncStorage.setItem(HOME_CURRENCY_PREF_KEY, next).catch(() => undefined);
+      return next;
+    });
+  }, []);
+
+  // Restore the user's saved display currency preference across app restarts.
+  useEffect(() => {
+    let cancelled = false;
+    AsyncStorage.getItem(HOME_CURRENCY_PREF_KEY)
+      .then((stored) => {
+        if (!cancelled && (stored === "NGN" || stored === "XLM")) {
+          setDisplayCurrency(stored);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // On mount: hydrate UI from cache instantly, then fetch fresh data and overwrite cache
   useEffect(() => {
     const loadFeed = async () => {
@@ -275,6 +330,48 @@ export default function HomeScreen() {
     void loadYieldData();
   }, [loadYieldData]);
 
+  // Home is the app's one first-ask moment for push notification consent —
+  // app boot (see _layout.tsx) deliberately does NOT trigger the native
+  // permission dialog so it isn't burned before the user sees any context.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const shouldShow = await shouldShowNotificationConsentPrompt();
+      if (!cancelled) {
+        setNotifPromptVisible(shouldShow);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleEnableNotifications = useCallback(async () => {
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(
+      () => undefined
+    );
+    setNotifRequesting(true);
+    try {
+      const status = await requestNotificationPermissionsAsync();
+      if (status === Notifications.PermissionStatus.GRANTED) {
+        await saveNotificationPreference(true);
+        // Fetches the Expo push token and registers it with the backend
+        // (POST /api/notifications/register) now that the user has consented.
+        await registerForPushNotificationsAsync();
+      }
+    } finally {
+      await markNotificationPromptDismissed();
+      setNotifRequesting(false);
+      setNotifPromptVisible(false);
+    }
+  }, []);
+
+  const handleDismissNotifPrompt = useCallback(() => {
+    void Haptics.selectionAsync().catch(() => undefined);
+    void markNotificationPromptDismissed();
+    setNotifPromptVisible(false);
+  }, []);
+
   useEffect(() => {
     const shimmerLoop = Animated.loop(
       Animated.timing(shimmerAnim, {
@@ -300,26 +397,44 @@ export default function HomeScreen() {
       Animated.sequence([
         Animated.timing(earningGlowAnim, {
           toValue: 1,
-          duration: 1400,
+          duration: 1200,
           useNativeDriver: true,
         }),
+
+        Animated.timing(earningGlowAnim, {
+          toValue: 0.4,
+          duration: 600,
+          useNativeDriver: true,
+        }),
+
         Animated.timing(earningGlowAnim, {
           toValue: 0,
-          duration: 1400,
+          duration: 800,
           useNativeDriver: true,
         }),
       ])
     );
     const pulseLoop = Animated.loop(
       Animated.sequence([
+        // Slight delay so the status dot follows the card glow.
+
+        Animated.delay(250),
+
         Animated.timing(earningPulseAnim, {
-          toValue: 1.08,
-          duration: 900,
+          toValue: 1.03,
+          duration: 500,
           useNativeDriver: true,
         }),
+
+        Animated.timing(earningPulseAnim, {
+          toValue: 1.06,
+          duration: 450,
+          useNativeDriver: true,
+        }),
+
         Animated.timing(earningPulseAnim, {
           toValue: 1,
-          duration: 900,
+          duration: 700,
           useNativeDriver: true,
         }),
       ])
@@ -404,43 +519,65 @@ export default function HomeScreen() {
       () => undefined
     );
     setSelectedItem(item);
-    setCommentsList([
-      {
-        id: "c1",
-        user: "Tolu",
-        text: "Thanks for the food! 😋",
-        time: "1h ago",
-      },
-      {
-        id: "c2",
-        user: "Ebube",
-        text: "Anytime! Let's do it again.",
-        time: "45m ago",
-      },
-    ]);
+    setCommentText("");
+    // Seed with an empty list; new comments are appended after a successful
+    // POST /api/social/comment so the drawer always reflects backend state.
+    setCommentsList([]);
     setCommentsModalVisible(true);
   };
 
-  const submitComment = () => {
-    if (!commentText.trim() || !selectedItem) return;
-    const newComment = {
-      id: Date.now().toString(),
+  const submitComment = async () => {
+    const trimmed = commentText.trim();
+    if (!trimmed || !selectedItem) return;
+
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light).catch(
+      () => undefined
+    );
+
+    const paymentId = selectedItem.id;
+    const optimistic: Comment = {
+      id: `local-${Date.now()}`,
       user: "Me",
-      text: commentText,
+      text: trimmed,
       time: "Just now",
     };
-    setCommentsList([...commentsList, newComment]);
-    setCommentText("");
 
-    // Update comments count on item
-    setFeed(
-      feed.map((item) => {
-        if (item.id === selectedItem.id) {
-          return { ...item, comments: item.comments + 1 };
-        }
-        return item;
-      })
+    // Optimistic UI: show the comment + bump the count immediately.
+    setCommentsList((prev) => [...prev, optimistic]);
+    setCommentText("");
+    setFeed((prev) =>
+      prev.map((item) =>
+        item.id === paymentId
+          ? { ...item, comments: item.comments + 1 }
+          : item
+      )
     );
+
+    try {
+      const saved = await addComment(paymentId, trimmed);
+      setCommentsList((prev) =>
+        prev.map((c) =>
+          c.id === optimistic.id
+            ? {
+                id: saved.id,
+                user: saved.username || "Me",
+                text: saved.content,
+                time: "Just now",
+              }
+            : c
+        )
+      );
+    } catch {
+      // Revert optimistic comment + count on failure.
+      setCommentsList((prev) => prev.filter((c) => c.id !== optimistic.id));
+      setFeed((prev) =>
+        prev.map((item) =>
+          item.id === paymentId
+            ? { ...item, comments: Math.max(0, item.comments - 1) }
+            : item
+        )
+      );
+    }
   };
 
   const openEarningsModal = () => {
@@ -538,6 +675,14 @@ export default function HomeScreen() {
       minimumFractionDigits: 2,
       maximumFractionDigits: 2,
     })}`;
+
+  const toggleBalanceMask = () => {
+    void Haptics.selectionAsync().catch(() => undefined);
+    setBalanceMasked((prev) => !prev);
+  };
+
+  const displayBalance = (amount: string) =>
+    balanceMasked ? MASKED_BALANCE : amount;
 
   const monthlyEarnings = useMemo(() => {
     const baseTotal = MONTHLY_EARNINGS.reduce(
@@ -666,12 +811,71 @@ export default function HomeScreen() {
           />
         }
       >
+        {/* Notification Permission Soft-Ask */}
+        {notifPromptVisible && (
+          <View style={styles.notifPromptCard}>
+            <View style={styles.notifPromptIconWrap}>
+              <Ionicons
+                name="notifications-outline"
+                size={20}
+                color={COLORS.primary}
+              />
+            </View>
+            <View style={styles.notifPromptTextWrap}>
+              <Text style={styles.notifPromptTitle}>Stay in the loop</Text>
+              <Text style={styles.notifPromptSubtitle}>
+                Get notified when you receive payments and earn yield.
+              </Text>
+              <View style={styles.notifPromptActions}>
+                <TouchableOpacity
+                  style={styles.notifPromptDismissBtn}
+                  onPress={handleDismissNotifPrompt}
+                  disabled={notifRequesting}
+                  accessibilityRole="button"
+                  accessibilityLabel="Dismiss notification prompt"
+                >
+                  <Text style={styles.notifPromptDismissText}>Not now</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={styles.notifPromptEnableBtn}
+                  onPress={handleEnableNotifications}
+                  disabled={notifRequesting}
+                  accessibilityRole="button"
+                  accessibilityLabel="Enable notifications"
+                >
+                  <Text style={styles.notifPromptEnableText}>
+                    {notifRequesting ? "Enabling…" : "Enable"}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </View>
+        )}
+
         {/* Balance Card */}
         <View style={styles.balanceCard}>
           {/* Available Balance Section */}
           <View style={styles.balanceSection}>
-            <Text style={styles.balanceLabel}>Available Balance</Text>
-            <Text style={styles.balanceAmount}>{availableBalance}</Text>
+            <View style={styles.balanceLabelRow}>
+              <Text style={styles.balanceLabel}>Available Balance</Text>
+              <TouchableOpacity
+                onPress={toggleBalanceMask}
+                hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                accessibilityRole="button"
+                accessibilityLabel={
+                  balanceMasked ? "Show balance" : "Hide balance"
+                }
+              >
+                <Ionicons
+                  name={balanceMasked ? "eye-outline" : "eye-off-outline"}
+                  size={20}
+                  color="#777"
+                />
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.balanceAmount}>
+              {displayBalance(availableBalance)}
+            </Text>
           </View>
 
           {/* Earning Balance Section */}
@@ -680,12 +884,19 @@ export default function HomeScreen() {
               <View style={styles.earningDot} />
               <Text style={styles.earningRowLabel}>Earning Balance</Text>
             </View>
-            <Text style={styles.earningBalanceAmount}>{totalYieldEarned}</Text>
+            <Text style={styles.earningBalanceAmount}>
+              {displayBalance(totalYieldEarned)}
+            </Text>
           </View>
 
+          {/* Pay / Request trigger button (#886) */}
           <TouchableOpacity
             style={styles.payRequestButton}
             onPress={() => router.push("/transfer")}
+            accessibilityRole="button"
+            accessibilityLabel="Pay / Request"
+            testID="pay-request-button"
+            activeOpacity={0.8}
           >
             <Ionicons
               name="send"
@@ -753,7 +964,9 @@ export default function HomeScreen() {
           >
             <View>
               <Text style={styles.earningLabel}>Earning Balance</Text>
-              <Text style={styles.earningAmount}>{totalYieldEarned}</Text>
+              <Text style={styles.earningAmount}>
+                {totalYieldEarnedDisplay}
+              </Text>
               <View style={styles.earningStatusRow}>
                 <Animated.View
                   style={[
@@ -793,7 +1006,7 @@ export default function HomeScreen() {
               <View style={styles.earningContent}>
                 <Text style={styles.earningLabel}>Earning Balance</Text>
                 <Text style={styles.earningAmount}>
-                  {yieldData?.totalYieldEarned ?? "₦0.00"}
+                  {totalYieldEarnedDisplay}
                 </Text>
                 <Text style={styles.earningHint}>
                   Tap to view yield breakdown
@@ -857,15 +1070,22 @@ export default function HomeScreen() {
         {/* Social Feed Section */}
         <View style={styles.feedContainer}>
           <Text style={styles.feedSectionTitle}>Activity</Text>
-          {/* Feed Tabs — Segment Control */}
+          {/* Feed Tabs — Public / Friends (#882) */}
           <View style={styles.tabBar}>
             <TouchableOpacity
               style={[
                 styles.tabItem,
                 activeTab === "public" && styles.tabItemActive,
               ]}
-              onPress={() => setActiveTab("public")}
+              onPress={() => {
+                void Haptics.selectionAsync().catch(() => undefined);
+                setActiveTab("public");
+              }}
               activeOpacity={0.85}
+              accessibilityRole="tab"
+              accessibilityState={{ selected: activeTab === "public" }}
+              accessibilityLabel="Public Feed"
+              testID="feed-tab-public"
             >
               <Text
                 style={[
@@ -881,8 +1101,15 @@ export default function HomeScreen() {
                 styles.tabItem,
                 activeTab === "friends" && styles.tabItemActive,
               ]}
-              onPress={() => setActiveTab("friends")}
+              onPress={() => {
+                void Haptics.selectionAsync().catch(() => undefined);
+                setActiveTab("friends");
+              }}
               activeOpacity={0.85}
+              accessibilityRole="tab"
+              accessibilityState={{ selected: activeTab === "friends" }}
+              accessibilityLabel="Friends Feed"
+              testID="feed-tab-friends"
             >
               <Text
                 style={[
@@ -909,16 +1136,25 @@ export default function HomeScreen() {
                 </View>
 
                 <View style={styles.paymentInfo}>
-                  <View style={styles.paymentRow}>
-                    <Text style={styles.paymentText} numberOfLines={2}>
-                      <Text style={styles.boldText}>{item.sender}</Text> paid{" "}
-                      <Text style={styles.boldText}>{item.receiver}</Text>
+                  <View style={styles.partyRow}>
+                    <Text style={styles.partyLabel}>FROM</Text>
+                    <Text style={styles.partyName} numberOfLines={1}>
+                      {item.sender}
                     </Text>
-                    <View style={styles.amountPill}>
-                      <Text style={styles.amountText}>{item.amount}</Text>
-                    </View>
+                  </View>
+                  <View style={styles.partyRow}>
+                    <Text style={styles.partyLabel}>TO</Text>
+                    <Text style={styles.partyName} numberOfLines={1}>
+                      {item.receiver}
+                    </Text>
                   </View>
                   <Text style={styles.timestamp}>{item.timestamp}</Text>
+                </View>
+
+                <View style={styles.amountPill}>
+                  <Text style={styles.amountText} numberOfLines={1}>
+                    {item.amount}
+                  </Text>
                 </View>
               </View>
 
@@ -933,6 +1169,11 @@ export default function HomeScreen() {
                 <TouchableOpacity
                   style={styles.actionItem}
                   onPress={() => handleLike(item.id)}
+                  accessibilityRole="button"
+                  accessibilityLabel={
+                    item.hasLiked ? "Unlike payment" : "Like payment"
+                  }
+                  testID={`feed-like-${item.id}`}
                 >
                   <Animated.View
                     style={{ transform: [{ scale: getScaleAnim(item.id) }] }}
@@ -956,6 +1197,9 @@ export default function HomeScreen() {
                 <TouchableOpacity
                   style={styles.actionItem}
                   onPress={() => openComments(item)}
+                  accessibilityRole="button"
+                  accessibilityLabel="Open comments"
+                  testID={`feed-comments-${item.id}`}
                 >
                   <Ionicons name="chatbubble-outline" size={20} color="#666" />
                   <Text style={styles.actionCount}>{item.comments}</Text>
@@ -1061,7 +1305,7 @@ export default function HomeScreen() {
                     Total Yield Earned
                   </Text>
                   <Text style={styles.earningsMetricValue}>
-                    {yieldData?.totalYieldEarned ?? "₦0.00"}
+                    {totalYieldEarnedDisplay}
                   </Text>
                 </View>
 
@@ -1183,6 +1427,71 @@ export default function HomeScreen() {
                     trackColor={{ false: "#E2E8F0", true: "#34D399" }}
                     thumbColor={COLORS.white}
                   />
+                </View>
+
+                {/* Compounding Growth Projection */}
+                <View style={styles.compoundingSection}>
+                  <Text style={styles.compoundingTitle}>
+                    Compounding growth projection
+                  </Text>
+                  <Text style={styles.compoundingSubtitle}>
+                    See how your earning balance could grow over time with compound interest at current APY
+                  </Text>
+                  
+                  <View style={styles.compoundingGraph}>
+                    {(() => {
+                      const currentBalance = parseCurrencyAmount(yieldData?.totalYieldEarned ?? "₦0");
+                      const apyValue = parseFloat(yieldData?.apy.replace("%", "") ?? "0") / 100;
+                      const monthlyRate = apyValue / 12;
+                      
+                      const projectionMonths = [
+                        { label: "3m", months: 3 },
+                        { label: "6m", months: 6 },
+                        { label: "9m", months: 9 },
+                        { label: "12m", months: 12 },
+                      ];
+                      
+                      const projections = projectionMonths.map((p) => {
+                        const futureValue = currentBalance * Math.pow(1 + monthlyRate, p.months);
+                        return { ...p, value: futureValue };
+                      });
+                      
+                      const maxValue = Math.max(...projections.map((p) => p.value)) || 1;
+                      
+                      return (
+                        <>
+                          {projections.map((proj, idx) => {
+                            const barHeight = (proj.value / maxValue) * 110;
+                            return (
+                              <View key={proj.label} style={styles.compoundingBar}>
+                                <View style={styles.compoundingBarContainer}>
+                                  <View
+                                    style={[
+                                      styles.compoundingBarFill,
+                                      { height: barHeight },
+                                    ]}
+                                  />
+                                </View>
+                                <Text style={styles.compoundingBarLabel}>{proj.label}</Text>
+                                <Text style={styles.compoundingBarValue}>
+                                  {formatCurrency(proj.value)}
+                                </Text>
+                              </View>
+                            );
+                          })}
+                        </>
+                      );
+                    })()}
+                  </View>
+                  
+                  <View style={styles.compoundingMeta}>
+                    <View style={styles.compoundingMetaRow}>
+                      <Ionicons name="information-circle-outline" size={14} color="#6B7280" />
+                      <Text style={styles.compoundingMetaText}>
+                        Assuming current APY of {yieldData?.apy ?? "0%"} remains constant
+                      </Text>
+                    </View>
+                  </View>
                 </View>
 
                 <Text style={styles.earningsInfoCopy}>
@@ -1355,17 +1664,29 @@ export default function HomeScreen() {
         </View>
       </Modal>
 
-      {/* Comments Modal */}
+      {/* Comments bottom drawer (#885) — slide-up Modal */}
       <Modal
         visible={commentsModalVisible}
         animationType="slide"
         transparent={true}
+        onRequestClose={() => setCommentsModalVisible(false)}
       >
         <View style={styles.modalOverlay}>
+          <TouchableOpacity
+            style={StyleSheet.absoluteFill}
+            activeOpacity={1}
+            onPress={() => setCommentsModalVisible(false)}
+            accessibilityLabel="Dismiss comments"
+          />
           <View style={styles.modalContent}>
+            <View style={styles.commentsGrabber} />
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>Comments</Text>
-              <TouchableOpacity onPress={() => setCommentsModalVisible(false)}>
+              <TouchableOpacity
+                onPress={() => setCommentsModalVisible(false)}
+                accessibilityRole="button"
+                accessibilityLabel="Close comments"
+              >
                 <Ionicons name="close" size={24} color="#000" />
               </TouchableOpacity>
             </View>
@@ -1373,7 +1694,12 @@ export default function HomeScreen() {
             <FlatList<Comment>
               data={commentsList}
               keyExtractor={(item: Comment) => item.id}
-              contentContainerStyle={{ paddingVertical: 12 }}
+              contentContainerStyle={{ paddingVertical: 12, flexGrow: 1 }}
+              ListEmptyComponent={
+                <Text style={styles.commentsEmpty}>
+                  Be the first to comment
+                </Text>
+              }
               renderItem={({ item }: { item: Comment }) => (
                 <View style={styles.commentItem}>
                   <View style={styles.commentAvatar}>
@@ -1396,8 +1722,22 @@ export default function HomeScreen() {
                 placeholder="Write a comment..."
                 value={commentText}
                 onChangeText={setCommentText}
+                returnKeyType="send"
+                onSubmitEditing={() => {
+                  void submitComment();
+                }}
+                accessibilityLabel="Comment input"
+                testID="comment-input"
               />
-              <TouchableOpacity style={styles.sendBtn} onPress={submitComment}>
+              <TouchableOpacity
+                style={styles.sendBtn}
+                onPress={() => {
+                  void submitComment();
+                }}
+                accessibilityRole="button"
+                accessibilityLabel="Send comment"
+                testID="comment-send"
+              >
                 <Ionicons name="send" size={20} color={COLORS.primary} />
               </TouchableOpacity>
             </View>
@@ -1456,14 +1796,79 @@ const styles = StyleSheet.create({
     shadowRadius: 10,
     elevation: 2,
   },
+  notifPromptCard: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    backgroundColor: COLORS.white,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+    padding: 14,
+    marginBottom: 16,
+    gap: 12,
+  },
+  notifPromptIconWrap: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: "#F0FDF4",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  notifPromptTextWrap: {
+    flex: 1,
+  },
+  notifPromptTitle: {
+    fontSize: 14,
+    fontFamily: "Outfit_600SemiBold",
+    color: "#111827",
+  },
+  notifPromptSubtitle: {
+    fontSize: 12,
+    fontFamily: "Outfit_400Regular",
+    color: "#6B7280",
+    marginTop: 2,
+  },
+  notifPromptActions: {
+    flexDirection: "row",
+    marginTop: 10,
+    gap: 10,
+  },
+  notifPromptDismissBtn: {
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderRadius: 14,
+    backgroundColor: "#F5F5F5",
+  },
+  notifPromptDismissText: {
+    fontSize: 13,
+    fontFamily: "Outfit_600SemiBold",
+    color: "#6B7280",
+  },
+  notifPromptEnableBtn: {
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 14,
+    backgroundColor: COLORS.primary,
+  },
+  notifPromptEnableText: {
+    fontSize: 13,
+    fontFamily: "Outfit_600SemiBold",
+    color: COLORS.secondary,
+  },
   balanceSection: {
     marginBottom: 16,
+  },
+  balanceLabelRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 4,
   },
   balanceLabel: {
     fontSize: 13,
     fontFamily: "Outfit_400Regular",
     color: "#777",
-    marginBottom: 4,
   },
   balanceAmount: {
     fontSize: 34,
@@ -2095,8 +2500,9 @@ const styles = StyleSheet.create({
     borderRadius: 10,
   },
   tabItemActive: {
-    backgroundColor: "#0F3D2E",
-    shadowColor: "#0F3D2E",
+    // Dark green active state (#882)
+    backgroundColor: COLORS.primary,
+    shadowColor: COLORS.primary,
     shadowOffset: { width: 0, height: 2 },
     shadowOpacity: 0.18,
     shadowRadius: 4,
@@ -2113,7 +2519,7 @@ const styles = StyleSheet.create({
   },
   feedCard: {
     backgroundColor: COLORS.white,
-    borderRadius: 24,
+    borderRadius: 20,
     padding: 16,
     marginBottom: 14,
     borderWidth: 1,
@@ -2126,7 +2532,7 @@ const styles = StyleSheet.create({
   },
   feedHeader: {
     flexDirection: "row",
-    alignItems: "flex-start",
+    alignItems: "center",
     marginBottom: 12,
   },
   avatarStack: {
@@ -2159,43 +2565,46 @@ const styles = StyleSheet.create({
   },
   paymentInfo: {
     flex: 1,
+    minWidth: 0,
+    gap: 3,
   },
-  paymentRow: {
+  partyRow: {
     flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "flex-start",
-    flexWrap: "wrap",
+    alignItems: "baseline",
+    gap: 6,
   },
-  paymentText: {
-    flex: 1,
-    fontSize: 15,
-    lineHeight: 20,
-    fontFamily: "Outfit_400Regular",
-    color: "#334155",
-    flexShrink: 1,
-    marginRight: 8,
-  },
-  boldText: {
+  partyLabel: {
+    width: 31,
+    fontSize: 9,
     fontFamily: "Outfit_700Bold",
-    color: "#111827",
+    color: "#94A3B8",
+  },
+  partyName: {
+    flex: 1,
+    minWidth: 0,
+    fontSize: 14,
+    lineHeight: 18,
+    fontFamily: "Outfit_700Bold",
+    color: "#17211D",
   },
   amountPill: {
     backgroundColor: "#F2F9F0",
     borderRadius: 999,
-    paddingHorizontal: 10,
+    paddingHorizontal: 9,
     paddingVertical: 6,
     borderWidth: 1,
     borderColor: "#DDF2DD",
-    alignSelf: "flex-start",
-    marginTop: 2,
+    alignSelf: "center",
+    marginLeft: 8,
+    maxWidth: 112,
   },
   amountText: {
-    fontSize: 13,
+    fontSize: 12,
     fontFamily: "Outfit_700Bold",
     color: "#2E7D32",
   },
   timestamp: {
-    fontSize: 12,
+    fontSize: 11,
     color: "#94A3B8",
     marginTop: 4,
   },
@@ -2205,7 +2614,7 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     paddingHorizontal: 12,
     paddingVertical: 10,
-    borderRadius: 16,
+    borderRadius: 12,
   },
   memoLabel: {
     fontSize: 11,
@@ -2252,8 +2661,23 @@ const styles = StyleSheet.create({
     borderTopRightRadius: 24,
     paddingHorizontal: 20,
     paddingBottom: 40,
-    paddingTop: 20,
+    paddingTop: 12,
     maxHeight: "75%",
+  },
+  commentsGrabber: {
+    alignSelf: "center",
+    width: 42,
+    height: 4,
+    borderRadius: 999,
+    backgroundColor: "#E2E8F0",
+    marginBottom: 10,
+  },
+  commentsEmpty: {
+    textAlign: "center",
+    color: "#94A3B8",
+    fontFamily: "Outfit_400Regular",
+    fontSize: 14,
+    paddingVertical: 28,
   },
   modalHeader: {
     flexDirection: "row",
@@ -2325,5 +2749,80 @@ const styles = StyleSheet.create({
   },
   sendBtn: {
     padding: 8,
+  },
+  // Compounding graph section
+  compoundingSection: {
+    marginTop: 20,
+    marginBottom: 4,
+    backgroundColor: "#F8FFF8",
+    borderRadius: 16,
+    padding: 16,
+    borderWidth: 1,
+    borderColor: "#E4F2E5",
+  },
+  compoundingTitle: {
+    fontSize: 14,
+    fontFamily: "Outfit_700Bold",
+    color: "#111827",
+    marginBottom: 4,
+  },
+  compoundingSubtitle: {
+    fontSize: 12,
+    fontFamily: "Outfit_400Regular",
+    color: "#6B7280",
+    marginBottom: 16,
+    lineHeight: 17,
+  },
+  compoundingGraph: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    justifyContent: "space-around",
+    height: 140,
+    paddingTop: 8,
+  },
+  compoundingBar: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "flex-end",
+    gap: 4,
+  },
+  compoundingBarContainer: {
+    width: 36,
+    height: 110,
+    justifyContent: "flex-end",
+    borderRadius: 6,
+    overflow: "hidden",
+    backgroundColor: "#E8F5E9",
+  },
+  compoundingBarFill: {
+    width: "100%",
+    backgroundColor: "#2E7D32",
+    borderRadius: 6,
+  },
+  compoundingBarLabel: {
+    fontSize: 11,
+    fontFamily: "Outfit_600SemiBold",
+    color: "#374151",
+    marginTop: 2,
+  },
+  compoundingBarValue: {
+    fontSize: 9,
+    fontFamily: "Outfit_400Regular",
+    color: "#6B7280",
+    textAlign: "center",
+  },
+  compoundingMeta: {
+    marginTop: 12,
+  },
+  compoundingMetaRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+  },
+  compoundingMetaText: {
+    fontSize: 11,
+    fontFamily: "Outfit_400Regular",
+    color: "#6B7280",
+    flex: 1,
   },
 });

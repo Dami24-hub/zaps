@@ -1,21 +1,111 @@
 use axum::{
+    middleware,
     routing::{delete, get, post},
     Router,
 };
 
+pub mod admin;
+pub use admin::admin_routes;
 pub mod auth;
+pub mod auth_middleware;
 pub mod bridge;
 pub mod feed;
+pub mod payouts;
+pub mod privy_jwks;
 pub mod social;
 pub mod user;
+pub use user as users;
 pub mod r#yield;
 
-pub fn auth_routes(pool: sqlx::PgPool) -> Router {
+// Re-export the middleware types used in main.rs so callers can import them
+// from `zaps_backend::api::*` without needing the full module path.
+pub use auth_middleware::{
+    auth_middleware, spawn_cache_sweep, AuthMiddlewareState, AuthTokenCache, AuthenticatedUser,
+};
+
+/// Builds the auth router from an already-assembled `AuthState` (pool +
+/// Privy JWKS client). Prefer this when the caller wants control over the
+/// JWKS URL / app ID (e.g. tests pointing at a mock JWKS server).
+///
+/// Uses an in-process rate limiter; see `auth_routes_with_limiter` for the
+/// Redis-backed one.
+pub fn auth_routes_with_state(state: auth::AuthState) -> Router {
+    auth_routes_with_limiter(state, auth::AuthRateLimiter::new())
+}
+
+/// #949: Auth router rate-limited by `limiter` (e.g. the Redis sliding
+/// window from `AuthRateLimiter::from_redis_url`), with session refresh (#943).
+pub fn auth_routes_with_limiter(state: auth::AuthState, limiter: auth::AuthRateLimiter) -> Router {
     Router::new()
         .route("/challenge", get(auth::get_challenge))
         .route("/verify", post(auth::verify_signature))
         .route("/privy", post(auth::privy_auth))
-        .with_state(pool)
+        .route("/refresh", post(auth::refresh_session))
+        .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            limiter,
+            auth::auth_rate_limit,
+        ))
+}
+
+/// Convenience wrapper that builds `AuthState` from `PRIVY_APP_ID` /
+/// `PRIVY_JWKS_URL` env vars and the rate limiter from `REDIS_URL` (see
+/// `config::Config`).
+pub fn auth_routes(pool: sqlx::PgPool) -> Router {
+    let config = crate::config::Config::from_env();
+    auth_routes_with_limiter(
+        auth::AuthState {
+            pool,
+            privy: std::sync::Arc::new(privy_jwks::PrivyJwksClient::new(config.privy_jwks_url)),
+            privy_app_id: config.privy_app_id,
+            cache: None,
+        },
+        auth::AuthRateLimiter::from_redis_url(config.redis_url.as_deref()),
+    )
+}
+
+/// #561 — Session Refresh & Auth Middleware
+///
+/// Wraps the supplied `router` with `auth_middleware` so that every route it
+/// contains requires a valid `Authorization: Bearer <token>` header.
+///
+/// Validated tokens are cached for up to 5 minutes in `cache` to avoid a DB
+/// round-trip on every request.  See `auth_middleware::AuthTokenCache` for the
+/// TTL and eviction semantics.
+///
+/// Bearer tokens are verified against dynamically fetched Privy JWKS, with
+/// fallback to local JWT validation for legacy tokens.
+///
+/// # Usage (in main.rs)
+/// ```rust
+/// let auth_cache = api::AuthTokenCache::new();
+/// let privy_jwks = api::privy_jwks::PrivyJwksClient::new(jwks_url);
+/// let protected = api::protected_routes(
+///     Router::new()
+///         .nest("/api/feed",   api::feed_routes(pool.clone()))
+///         .nest("/api/social", api::social_routes(pool.clone())),
+///     pool.clone(),
+///     auth_cache,
+///     privy_jwks,
+///     privy_app_id,
+/// );
+/// ```
+pub fn protected_routes(
+    router: Router,
+    pool: sqlx::PgPool,
+    cache: AuthTokenCache,
+    privy: std::sync::Arc<privy_jwks::PrivyJwksClient>,
+    privy_app_id: String,
+) -> Router {
+    router.layer(middleware::from_fn_with_state(
+        AuthMiddlewareState {
+            pool,
+            cache,
+            privy,
+            privy_app_id,
+        },
+        auth_middleware,
+    ))
 }
 
 /// User routes without a Redis cache; username resolution falls through to Postgres.
@@ -30,12 +120,16 @@ pub fn user_routes_with_state(state: user::UserState) -> Router {
             "/profile",
             get(user::get_profile).post(user::update_profile),
         )
+        .route("/profile/avatar", post(user::upload_avatar))
         .route("/search", get(user::search_users))
+        .route("/suggestions", get(user::suggest_usernames))
+        .route("/autocomplete", get(user::autocomplete))
         .route("/friends", get(user::list_friends))
         .route("/friends/request", post(user::send_friend_request))
         .route("/friends/:id/accept", post(user::accept_friend_request))
         .route("/friends/:id/reject", post(user::reject_friend_request))
         .route("/resolve/:username", get(user::resolve_address))
+        .route("/did/:did", get(user::get_user_by_did))
         .with_state(state)
 }
 
@@ -47,10 +141,41 @@ pub fn feed_routes(pool: sqlx::PgPool) -> Router {
         .with_state(pool)
 }
 
-/// #543
-pub fn payout_routes(pool: sqlx::PgPool) -> Router {
+pub fn registry_routes(pool: sqlx::PgPool) -> Router {
+    Router::new()
+        .route("/claims", get(user::get_registry_claims))
+        .route("/stats", get(user::get_registry_stats))
+        .with_state(pool)
+}
+
+/// #543 / #935
+///
+/// Takes `BridgeState` (rather than a bare pool) so the batch-upload handlers
+/// — which need the shared bridge state — can live on the same router as the
+/// rest of the payout endpoints; `payouts::*` handlers keep extracting a
+/// plain `State<PgPool>` via the `FromRef<BridgeState> for PgPool` impl in
+/// `bridge.rs`.
+pub fn payout_routes(state: bridge::BridgeState) -> Router {
     Router::new()
         .route("/username", post(feed::payout_by_username))
+        .route("/batches", get(payouts::list_batches))
+        // #935: POST /api/payouts/batch accepts a JSON array of payouts;
+        // /batch/csv accepts the same data as a multipart CSV upload.
+        .route("/batch", post(bridge::batch_upload))
+        .route("/batch/csv", post(bridge::batch_upload_csv))
+        .route("/batch/:id", get(payouts::get_batch_detail))
+        .route("/batch/:id/export", get(payouts::export_batch))
+        // #728 — block transfers to sanctioned addresses before processing.
+        .layer(middleware::from_fn(
+            auth_middleware::compliance_sanitize_middleware,
+        ))
+        .with_state(state)
+}
+
+/// #957 — Public SDP webhook receiver route (authenticated via HMAC signature, not user JWT)
+pub fn payout_webhook_routes(pool: sqlx::PgPool) -> Router {
+    Router::new()
+        .route("/sdp/webhook", post(payouts::sdp_reconciliation_webhook))
         .with_state(pool)
 }
 
@@ -82,8 +207,14 @@ pub fn yield_routes_with_state(state: r#yield::YieldState) -> Router {
         .route("/balance", get(r#yield::get_balance))
         .route("/metrics", get(r#yield::get_metrics))
         .route("/history", get(r#yield::get_history))
+        .route("/rates/history", get(r#yield::get_rate_history))
         .route("/deposit", post(r#yield::deposit))
         .route("/withdraw", post(r#yield::withdraw))
         .route("/toggle-auto", post(r#yield::toggle_auto_earn))
+        // #549 — Unsigned Transaction XDR Generator
+        // These routes construct unsigned Soroban transaction envelopes for
+        // client-side signing without touching the database.
+        .route("/build/deposit", post(r#yield::build_unsigned_deposit))
+        .route("/build/withdraw", post(r#yield::build_unsigned_withdraw))
         .with_state(state)
 }

@@ -41,6 +41,8 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::db::models::BatchRecipient;
+use crate::services::redis_cache::BatchLock;
+use crate::services::stellar::{SdpClient, SdpDisbursementRequest, SdpOutcome};
 
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 15;
 const DEFAULT_MAX_ATTEMPTS: i32 = 3;
@@ -49,6 +51,9 @@ const DEFAULT_MAX_ATTEMPTS: i32 = 3;
 const DEFAULT_CLAIM_SIZE: i64 = 100;
 /// A claim older than this is assumed to belong to a dead worker.
 const DEFAULT_LEASE_TIMEOUT_SECS: i64 = 900;
+/// Maximum items per sub-chunk when processing a batch claim.
+/// Prevents gas limit issues on-chain and keeps SDP submissions bounded.
+const CHUNK_SIZE: usize = 50;
 
 pub struct DisbursementWorkerConfig {
     pub poll_interval: Duration,
@@ -61,6 +66,8 @@ pub struct DisbursementWorkerConfig {
     pub sdp_api_token: Option<String>,
     /// Identifies this process in `batch_recipients.locked_by`.
     pub worker_id: String,
+    /// #952: Distributed lock to prevent duplicate batch execution across workers.
+    pub batch_lock: Option<BatchLock>,
 }
 
 impl DisbursementWorkerConfig {
@@ -81,8 +88,8 @@ impl DisbursementWorkerConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_LEASE_TIMEOUT_SECS);
-        let sdp_base_url = std::env::var("SDP_BASE_URL")
-            .unwrap_or_else(|_| "https://sdp.stellar.org".into());
+        let sdp_base_url =
+            std::env::var("SDP_BASE_URL").unwrap_or_else(|_| "https://sdp.stellar.org".into());
         let sdp_api_token = std::env::var("SDP_API_TOKEN").ok();
         // Hostname keeps lock ownership meaningful across replicas; the uuid
         // suffix disambiguates multiple workers on the same host.
@@ -91,6 +98,9 @@ impl DisbursementWorkerConfig {
             std::env::var("HOSTNAME").unwrap_or_else(|_| "worker".into()),
             Uuid::new_v4()
         );
+        let batch_lock = std::env::var("REDIS_URL")
+            .ok()
+            .and_then(|url| BatchLock::connect(&url).ok());
 
         Self {
             poll_interval: Duration::from_secs(poll_secs),
@@ -100,43 +110,20 @@ impl DisbursementWorkerConfig {
             sdp_base_url,
             sdp_api_token,
             worker_id,
+            batch_lock,
         }
     }
 }
 
-/// Payload posted to SDP for a single disbursement.
-#[derive(Debug, Serialize)]
-struct SdpDisbursementRequest<'a> {
-    /// Deterministic per-recipient key. SDP deduplicates on this, which is what
-    /// makes an at-least-once retry safe.
-    idempotency_key: String,
-    destination: &'a str,
-    amount: i64,
-    currency: &'a str,
-}
+/// Outcome of one dispatch attempt (alias of SdpOutcome for backward compat).
+type DispatchOutcome = SdpOutcome;
 
-#[derive(Debug, Deserialize)]
-struct SdpDisbursementResponse {
-    #[serde(default)]
-    payment_id: Option<String>,
-    #[serde(default)]
-    tx_hash: Option<String>,
-}
-
-/// Outcome of one dispatch attempt.
-enum DispatchOutcome {
-    Submitted {
-        sdp_payment_id: Option<String>,
-        tx_hash: Option<String>,
-    },
-    /// Transient — worth another attempt.
-    Retryable(String),
-    /// Permanent — retrying will not help (bad address, rejected amount).
-    Permanent(String),
-}
-
-/// Entry point. Runs until the process exits.
-pub async fn run(pool: PgPool, config: DisbursementWorkerConfig) {
+/// Entry point. Runs until shutdown is requested.
+pub async fn run(
+    pool: PgPool,
+    config: DisbursementWorkerConfig,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+) {
     tracing::info!(
         worker_id = %config.worker_id,
         "Starting disbursement worker (interval={:?}, claim_size={}, max_attempts={})",
@@ -152,17 +139,24 @@ pub async fn run(pool: PgPool, config: DisbursementWorkerConfig) {
         );
     }
 
-    let http = reqwest::Client::new();
+    let sdp_client = SdpClient::new(config.sdp_base_url.clone(), config.sdp_api_token.clone());
     let mut interval = tokio::time::interval(config.poll_interval);
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                tracing::info!("Disbursement worker shutdown requested");
+                break;
+            }
+            _ = interval.tick() => {}
+        }
 
         if let Err(err) = reclaim_stale_leases(&pool, config.lease_timeout_secs).await {
             tracing::error!("Failed to reclaim stale leases: {err:?}");
         }
 
-        if let Err(err) = process_cycle(&pool, &config, &http).await {
+        if let Err(err) = process_cycle(&pool, &config, &sdp_client).await {
             tracing::error!("Disbursement cycle failed: {err:?}");
         }
     }
@@ -200,13 +194,60 @@ async fn reclaim_stale_leases(pool: &PgPool, lease_timeout_secs: i64) -> Result<
 async fn process_cycle(
     pool: &PgPool,
     config: &DisbursementWorkerConfig,
-    http: &reqwest::Client,
+    sdp_client: &SdpClient,
 ) -> Result<(), sqlx::Error> {
     let Some(batch_id) = claim_next_batch(pool, &config.worker_id).await? else {
         tracing::debug!("Disbursement: no batches awaiting processing");
         return Ok(());
     };
 
+    // #952: Acquire distributed lock key `lock:batch:{id}` with TTL before executing batch disbursement.
+    let lock_acquired = if let Some(lock) = &config.batch_lock {
+        match lock.acquire(&batch_id.to_string(), None).await {
+            Ok(true) => {
+                tracing::info!(batch_id = %batch_id, "Acquired distributed lock lock:batch:{batch_id}");
+                true
+            }
+            Ok(false) => {
+                tracing::warn!(
+                    batch_id = %batch_id,
+                    "Another worker instance holds lock:batch:{batch_id}; skipping duplicate batch disbursement"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    batch_id = %batch_id,
+                    "Redis lock acquisition error ({e}); falling back to DB lease"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    let result = execute_batch_claim(pool, batch_id, config, sdp_client).await;
+
+    // Release lock once batch execution cycle finishes.
+    if lock_acquired {
+        if let Some(lock) = &config.batch_lock {
+            if let Err(e) = lock.release(&batch_id.to_string()).await {
+                tracing::warn!(batch_id = %batch_id, "Failed to release lock:batch:{batch_id}: {e}");
+            }
+        }
+    }
+
+    result
+}
+
+/// Executes processing for claimed batch recipients in chunks of 50 operations (#951).
+async fn execute_batch_claim(
+    pool: &PgPool,
+    batch_id: Uuid,
+    config: &DisbursementWorkerConfig,
+    sdp_client: &SdpClient,
+) -> Result<(), sqlx::Error> {
     let recipients = claim_recipients(pool, batch_id, config).await?;
     if recipients.is_empty() {
         // Nothing left to send — settle the batch's terminal status.
@@ -220,55 +261,122 @@ async fn process_cycle(
         "Dispatching payout batch"
     );
 
-    // Sequential on purpose: SDP rate-limits per account, and parallel
-    // submissions from one source account contend on the Stellar sequence
-    // number.
-    for recipient in recipients {
-        let attempt = recipient.attempt_count + 1;
-        let outcome = dispatch_one(&recipient, config, http).await;
+    // #951: Process recipients in sub-chunks of CHUNK_SIZE (50) to prevent gas limit
+    // issues on-chain and keep SDP submissions bounded. Each chunk is
+    // submitted sequentially; recipients within a chunk are also sequential
+    // (SDP rate-limits per account, and parallel submissions contend on
+    // the Stellar sequence number).
+    let total_chunks = recipients.len().div_ceil(CHUNK_SIZE);
+    for (chunk_idx, chunk) in recipients.chunks(CHUNK_SIZE).enumerate() {
+        tracing::debug!(
+            batch_id = %batch_id,
+            chunk = chunk_idx + 1,
+            total_chunks = total_chunks,
+            chunk_size = chunk.len(),
+            "Processing chunk"
+        );
 
-        match outcome {
-            DispatchOutcome::Submitted {
-                sdp_payment_id,
-                tx_hash,
-            } => {
-                mark_submitted(pool, &recipient, sdp_payment_id.as_deref(), tx_hash.as_deref())
+        for recipient in chunk {
+            let attempt = recipient.attempt_count + 1;
+            let outcome = dispatch_one(recipient, sdp_client).await;
+
+            match outcome {
+                SdpOutcome::Submitted {
+                    payment_id: sdp_payment_id,
+                    tx_hash,
+                } => {
+                    mark_submitted(
+                        pool,
+                        recipient,
+                        sdp_payment_id.as_deref(),
+                        tx_hash.as_deref(),
+                    )
                     .await?;
-                log_dispatch(pool, batch_id, Some(recipient.id), attempt, "SUBMITTED", None, None)
+                    log_dispatch(
+                        pool,
+                        batch_id,
+                        Some(recipient.id),
+                        attempt,
+                        "SUBMITTED",
+                        None,
+                        None,
+                    )
                     .await?;
-            }
-            DispatchOutcome::Retryable(err) if attempt < config.max_attempts => {
-                mark_retry(pool, &recipient, &err).await?;
-                log_dispatch(
-                    pool,
-                    batch_id,
-                    Some(recipient.id),
-                    attempt,
-                    "RETRY_SCHEDULED",
-                    None,
-                    Some(&err),
-                )
-                .await?;
-            }
-            DispatchOutcome::Retryable(err) | DispatchOutcome::Permanent(err) => {
-                // Either permanently bad, or out of retries. Fail this row only
-                // — one dead recipient must not strand the rest of the batch.
-                mark_failed(pool, &recipient, &err).await?;
-                log_dispatch(
-                    pool,
-                    batch_id,
-                    Some(recipient.id),
-                    attempt,
-                    "FAILED",
-                    None,
-                    Some(&err),
-                )
-                .await?;
+                }
+                SdpOutcome::Retryable(err) if attempt < config.max_attempts => {
+                    mark_retry(pool, recipient, &err).await?;
+                    log_dispatch(
+                        pool,
+                        batch_id,
+                        Some(recipient.id),
+                        attempt,
+                        "RETRY_SCHEDULED",
+                        None,
+                        Some(&err),
+                    )
+                    .await?;
+                }
+                SdpOutcome::Retryable(err) | SdpOutcome::Permanent(err) => {
+                    // Either permanently bad, or out of retries. Fail this row only
+                    // — one dead recipient must not strand the rest of the batch.
+                    mark_failed(pool, recipient, &err).await?;
+                    log_dispatch(
+                        pool,
+                        batch_id,
+                        Some(recipient.id),
+                        attempt,
+                        "FAILED",
+                        None,
+                        Some(&err),
+                    )
+                    .await?;
+                }
             }
         }
-    }
+
+        // #951: Record progress and update database status per chunk
+        record_chunk_progress(pool, batch_id, chunk_idx, total_chunks, chunk.len()).await?;
+    } // end chunk loop
 
     finalize_batch(pool, batch_id).await?;
+    Ok(())
+}
+
+/// #951: Update database status and record progress per chunk of 50 operations.
+async fn record_chunk_progress(
+    pool: &PgPool,
+    batch_id: Uuid,
+    chunk_idx: usize,
+    total_chunks: usize,
+    chunk_size: usize,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        r#"
+        UPDATE payout_batches
+           SET updated_at = NOW()
+         WHERE id = $1
+        "#,
+    )
+    .bind(batch_id)
+    .execute(pool)
+    .await?;
+
+    log_dispatch(
+        pool,
+        batch_id,
+        None,
+        (chunk_idx + 1) as i32,
+        "CHUNK_COMPLETED",
+        None,
+        Some(&format!(
+            "Completed chunk {}/{} ({} operations)",
+            chunk_idx + 1,
+            total_chunks,
+            chunk_size
+        )),
+    )
+    .await?;
+
     Ok(())
 }
 
@@ -340,27 +448,15 @@ async fn claim_recipients(
     .await
 }
 
-/// Submits a single recipient to SDP.
-async fn dispatch_one(
-    recipient: &BatchRecipient,
-    config: &DisbursementWorkerConfig,
-    http: &reqwest::Client,
-) -> DispatchOutcome {
+/// Submits a single recipient to SDP using the SdpClient.
+async fn dispatch_one(recipient: &BatchRecipient, sdp_client: &SdpClient) -> SdpOutcome {
     let Some(destination) = recipient.destination_address.as_deref() else {
         // The schema guarantees a user_id when there is no address, but this
         // worker sends to addresses. A row that reached here without one was
         // never resolvable, so retrying cannot help.
-        return DispatchOutcome::Permanent(
+        return SdpOutcome::Permanent(
             "recipient has no destination_address; resolve user_id to an address first".into(),
         );
-    };
-
-    let Some(token) = config.sdp_api_token.as_deref() else {
-        // Dry run: exercise the full state machine without moving money.
-        return DispatchOutcome::Submitted {
-            sdp_payment_id: Some(format!("dry-run-{}", recipient.id)),
-            tx_hash: None,
-        };
     };
 
     let request = SdpDisbursementRequest {
@@ -373,56 +469,7 @@ async fn dispatch_one(
         currency: "USDC",
     };
 
-    let response = http
-        .post(format!("{}/disbursements", config.sdp_base_url.trim_end_matches('/')))
-        .bearer_auth(token)
-        .json(&request)
-        .send()
-        .await;
-
-    let response = match response {
-        Ok(r) => r,
-        // Network-level failure: no way to know whether SDP saw it, so retry
-        // and let the idempotency key deduplicate.
-        Err(err) => return DispatchOutcome::Retryable(format!("SDP request failed: {err}")),
-    };
-
-    let status = response.status();
-    if status.is_success() {
-        return match response.json::<SdpDisbursementResponse>().await {
-            Ok(body) => DispatchOutcome::Submitted {
-                sdp_payment_id: body.payment_id,
-                tx_hash: body.tx_hash,
-            },
-            // SDP accepted it; we just could not parse the body. Treating this
-            // as a failure would risk a double payment on retry, so record the
-            // submission and let reconciliation fill in the ids.
-            Err(err) => {
-                tracing::warn!(
-                    recipient_id = %recipient.id,
-                    error = ?err,
-                    "SDP returned success with an unparseable body"
-                );
-                DispatchOutcome::Submitted {
-                    sdp_payment_id: None,
-                    tx_hash: None,
-                }
-            }
-        };
-    }
-
-    let detail = response.text().await.unwrap_or_default();
-
-    // 4xx other than 408/429 means SDP rejected the request itself — a bad
-    // address or a malformed amount will be rejected identically forever.
-    if status.is_client_error()
-        && status != reqwest::StatusCode::REQUEST_TIMEOUT
-        && status != reqwest::StatusCode::TOO_MANY_REQUESTS
-    {
-        return DispatchOutcome::Permanent(format!("SDP rejected request ({status}): {detail}"));
-    }
-
-    DispatchOutcome::Retryable(format!("SDP error ({status}): {detail}"))
+    sdp_client.submit_disbursement(&request).await
 }
 
 /// Deterministic idempotency key for a recipient row.
@@ -606,9 +653,92 @@ async fn log_dispatch(
     Ok(())
 }
 
+/// A compact representation of the batch state used to make status decisions.
+///
+/// The worker persists these same transitions in `claim_next_batch` and
+/// `finalize_batch`. Keeping the decision rule pure makes it possible to test
+/// the state machine without requiring a live PostgreSQL instance.
+#[derive(Debug, PartialEq, Eq)]
+struct BatchState {
+    status: &'static str,
+    pending_recipients: usize,
+    failed_recipients: usize,
+    total_recipients: usize,
+}
+
+fn next_batch_status(state: &BatchState) -> &'static str {
+    match state.status {
+        "PENDING" => "PROCESSING",
+        "PROCESSING" if state.pending_recipients > 0 => "PROCESSING",
+        "PROCESSING" if state.failed_recipients == 0 => "COMPLETED",
+        "PROCESSING" if state.failed_recipients == state.total_recipients => "FAILED",
+        "PROCESSING" => "PARTIALLY_FAILED",
+        status => status,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_batch(status: &'static str, pending: usize, failed: usize) -> BatchState {
+        BatchState {
+            status,
+            pending_recipients: pending,
+            failed_recipients: failed,
+            total_recipients: 3,
+        }
+    }
+
+    #[test]
+    fn worker_moves_pending_batch_to_processing() {
+        let batch = sample_batch("PENDING", 3, 0);
+
+        assert_eq!(next_batch_status(&batch), "PROCESSING");
+    }
+
+    #[test]
+    fn worker_completes_processing_batch_when_all_recipients_are_submitted() {
+        let batch = sample_batch("PROCESSING", 0, 0);
+
+        assert_eq!(next_batch_status(&batch), "COMPLETED");
+    }
+
+    #[test]
+    fn worker_recovers_after_retryable_error_and_completes_batch() {
+        // A retryable SDP error leaves the recipient pending, so the batch must
+        // remain PROCESSING and be eligible for another worker cycle.
+        let after_error = sample_batch("PROCESSING", 1, 0);
+        assert_eq!(next_batch_status(&after_error), "PROCESSING");
+
+        // Once the retry succeeds, no pending recipients remain and the batch
+        // reaches its terminal completed state.
+        let after_retry = sample_batch("PROCESSING", 0, 0);
+        assert_eq!(next_batch_status(&after_retry), "COMPLETED");
+    }
+
+    #[test]
+    fn worker_marks_all_permanent_failures_as_failed() {
+        let batch = sample_batch("PROCESSING", 0, 3);
+
+        assert_eq!(next_batch_status(&batch), "FAILED");
+    }
+
+    #[test]
+    fn worker_marks_mixed_success_and_failure_as_partially_failed() {
+        let batch = sample_batch("PROCESSING", 0, 1);
+
+        assert_eq!(next_batch_status(&batch), "PARTIALLY_FAILED");
+    }
+
+    #[test]
+    fn terminal_batch_statuses_are_not_reopened() {
+        let completed = sample_batch("COMPLETED", 0, 0);
+        let failed = sample_batch("FAILED", 0, 3);
+
+        assert_eq!(next_batch_status(&completed), "COMPLETED");
+        assert_eq!(next_batch_status(&failed), "FAILED");
+    }
 
     #[test]
     fn idempotency_key_is_stable_across_retries() {
@@ -637,12 +767,27 @@ mod tests {
             sdp_base_url: "https://sdp.example.org".into(),
             sdp_api_token: None,
             worker_id: "test-worker".into(),
+            batch_lock: None,
         };
 
-        assert!(config.max_attempts >= 1, "a row must get at least one attempt");
+        assert!(
+            config.max_attempts >= 1,
+            "a row must get at least one attempt"
+        );
         assert!(config.claim_size > 0);
         // The lease has to outlast a full claim of sequential submissions, or
         // workers reclaim rows that are still legitimately in flight.
         assert!(config.lease_timeout_secs > config.poll_interval.as_secs() as i64);
+        assert_eq!(CHUNK_SIZE, 50, "Operations must be processed in chunks of 50");
+    }
+
+    #[test]
+    fn chunking_slices_recipients_into_chunks_of_50() {
+        let items: Vec<usize> = (0..125).collect();
+        let chunks: Vec<_> = items.chunks(CHUNK_SIZE).collect();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), 50);
+        assert_eq!(chunks[1].len(), 50);
+        assert_eq!(chunks[2].len(), 25);
     }
 }

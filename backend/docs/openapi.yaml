@@ -32,6 +32,33 @@ components:
       bearerFormat: JWT
       description: JWT obtained from POST /api/auth/verify
 
+  responses:
+    BadRequest:
+      description: Bad Request - Invalid input, missing required fields, or malformed data
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: Invalid signature format (must be hex or base64)
+
+    Unauthorized:
+      description: Unauthorized - Missing or invalid JWT / authentication credentials
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: Missing authorization header
+
+    TooManyRequests:
+      description: Too Many Requests - Rate limit exceeded; retry after a short delay
+      content:
+        text/plain:
+          schema:
+            type: string
+          example: Too many requests, please try again later.
+
   schemas:
     ErrorResponse:
       type: object
@@ -125,6 +152,27 @@ components:
         avatar_url:
           type: string
           nullable: true
+
+    UserSuggestionsResponse:
+      type: object
+      properties:
+        query:
+          type: string
+          description: The normalised (lowercased, trimmed) prefix that was matched.
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/SearchUser'
+        limit:
+          type: integer
+        offset:
+          type: integer
+        total:
+          type: integer
+          format: int64
+          description: Total matches for the prefix, ignoring limit/offset.
+        has_more:
+          type: boolean
 
     FriendUser:
       type: object
@@ -538,6 +586,8 @@ paths:
                 $ref: '#/components/schemas/ChallengeResponse'
               example:
                 challenge: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
 
   /api/auth/verify:
     post:
@@ -574,6 +624,8 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
               example:
                 error: Signature verification failed
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
         '500':
           description: Internal server error
           content:
@@ -606,6 +658,8 @@ paths:
                 $ref: '#/components/schemas/ErrorResponse'
               example:
                 error: Missing authorization header
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
         '500':
           description: Internal server error
           content:
@@ -641,6 +695,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
         '500':
           description: Internal server error
           content:
@@ -660,9 +716,31 @@ paths:
         - name: q
           in: query
           required: true
-          description: Search term matched against username and address (ILIKE)
+          description: >-
+            Prefix matched case-insensitively against username, and
+            case-sensitively against address. LIKE metacharacters are escaped
+            and matched literally.
           schema:
             type: string
+            minLength: 1
+            maxLength: 64
+        - name: limit
+          in: query
+          required: false
+          description: Page size, clamped to 1-50.
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 50
+        - name: offset
+          in: query
+          required: false
+          description: Rows to skip; negative values are clamped to 0.
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
       responses:
         '200':
           description: Matching users
@@ -672,12 +750,82 @@ paths:
                 type: array
                 items:
                   $ref: '#/components/schemas/SearchUser'
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           description: Missing or invalid JWT
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/users/suggestions:
+    get:
+      tags:
+        - Users
+      summary: Username autocomplete suggestions (paginated)
+      description: >-
+        Username-only prefix search for autocomplete. Unlike /api/users/search
+        this validates `q` as a username prefix (lowercase alphanumeric, at most
+        15 characters) and returns a paginated envelope with the total number of
+        matches alongside each profile's avatar.
+      operationId: suggestUsernames
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: >-
+            Username prefix. Lowercased before matching; rejected with 400 if it
+            is empty, longer than 15 characters, or contains anything other than
+            lowercase letters and digits.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 15
+        - name: limit
+          in: query
+          required: false
+          description: Page size, clamped to 1-25.
+          schema:
+            type: integer
+            default: 10
+            minimum: 1
+            maximum: 25
+        - name: offset
+          in: query
+          required: false
+          description: Rows to skip; negative values are clamped to 0.
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+      responses:
+        '200':
+          description: Paginated username suggestions
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserSuggestionsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Missing or invalid JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
         '500':
           description: Internal server error
           content:
@@ -708,6 +856,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
         '500':
           description: Internal server error
           content:
@@ -755,6 +905,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
         '500':
           description: Internal server error
           content:
@@ -810,11 +962,7 @@ paths:
                 items:
                   $ref: '#/components/schemas/FeedItem'
         '401':
-          description: Missing or invalid JWT
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
+          $ref: '#/components/responses/Unauthorized'
         '500':
           description: Internal server error
           content:
@@ -840,11 +988,7 @@ paths:
                 items:
                   $ref: '#/components/schemas/FeedItem'
         '401':
-          description: Missing or invalid JWT
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
+          $ref: '#/components/responses/Unauthorized'
         '500':
           description: Internal server error
           content:
@@ -1177,11 +1321,7 @@ paths:
                 offset: 0
                 total: 1
         '401':
-          description: Missing or invalid JWT
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
+          $ref: '#/components/responses/Unauthorized'
         '500':
           description: Internal server error
           content:
@@ -1229,11 +1369,7 @@ paths:
                     error: Insufficient available balance
                     available: 1000000
         '401':
-          description: Missing or invalid JWT
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
+          $ref: '#/components/responses/Unauthorized'
         '500':
           description: Internal server error
           content:
@@ -1281,11 +1417,7 @@ paths:
                     error: Insufficient earning balance
                     earning: 1000000
         '401':
-          description: Missing or invalid JWT
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
+          $ref: '#/components/responses/Unauthorized'
         '500':
           description: Internal server error
           content:
@@ -1320,11 +1452,7 @@ paths:
                 auto_earn_enabled: true
                 message: "Auto-earn enabled. Idle stablecoins will be swept into the yield vault."
         '401':
-          description: Missing or invalid JWT
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
+          $ref: '#/components/responses/Unauthorized'
         '500':
           description: Internal server error
           content:

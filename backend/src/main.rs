@@ -2,7 +2,7 @@
 
 use axum::{
     extract::State,
-    http::{Request, StatusCode},
+    http::{header, header::HeaderValue, Method, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
-use tower_http::{classify::ServerErrorsFailureClass, trace::TraceLayer};
+use tower_http::{classify::ServerErrorsFailureClass, cors::CorsLayer, trace::TraceLayer};
 use tracing::Span;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -32,6 +32,7 @@ use zaps_backend::services;
 struct HealthState {
     pool: sqlx::PgPool,
     stellar_rpc_url: String,
+    redis_url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -65,10 +66,19 @@ struct RpcHealth {
 }
 
 #[derive(Serialize)]
+struct RedisHealth {
+    status: &'static str,
+    latency_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
 struct HealthComponents {
     database: DbHealth,
     yield_db: YieldDbHealth,
     soroban_rpc: RpcHealth,
+    redis: RedisHealth,
 }
 
 #[derive(Serialize)]
@@ -148,6 +158,36 @@ async fn rate_limiter_middleware(
     }
 }
 
+/// Build a broad-but-whitelisted CORS layer from the configured origins.
+///
+/// Requests originating from domains not in `origins` still reach the router,
+/// but the response carries no CORS headers, so browsers refuse to read it.
+/// Unparseable origins are logged and skipped so a bad value never panics
+/// the server at startup.
+fn cors_layer(origins: &[String]) -> CorsLayer {
+    let mut allowed = Vec::with_capacity(origins.len());
+    for origin in origins {
+        match HeaderValue::from_str(origin) {
+            Ok(value) => allowed.push(value),
+            Err(e) => tracing::warn!("Ignoring invalid CORS origin {origin:?}: {e}"),
+        }
+    }
+
+    CorsLayer::new()
+        .allow_origin(allowed)
+        .allow_methods([
+            Method::GET,
+            Method::HEAD,
+            Method::OPTIONS,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ])
+        .allow_headers([header::ACCEPT, header::AUTHORIZATION, header::CONTENT_TYPE])
+        .allow_credentials(true)
+}
+
 #[tokio::main]
 async fn main() {
     // Initialize logging
@@ -173,6 +213,14 @@ async fn main() {
 
     // Initialize rate limiter: 5 requests per second, max 10 tokens
     let rate_limiter = RateLimiter::new(5, 10);
+
+    // #561 — Session Refresh & Auth Middleware
+    // Build the shared in-memory token cache.  Validated JWT tokens are cached
+    // for TOKEN_CACHE_TTL (5 min) to avoid a DB round-trip on every request.
+    let auth_cache = api::AuthTokenCache::new();
+
+    // Spawn the background sweep task that evicts expired entries every 10 min.
+    api::spawn_cache_sweep(auth_cache.clone());
 
     // BE-061: Redis pool backing the yield cache. Shared by the API (read-through)
     // and the indexer (eviction on yield events). Absent REDIS_URL — or an
@@ -215,42 +263,103 @@ async fn main() {
         None => None,
     };
 
+    // #952: Redis-backed distributed lock for payout batches.
+    let batch_lock = match config.redis_url.as_deref() {
+        Some(url) => match services::redis_cache::BatchLock::connect(url) {
+            Ok(lock) => {
+                tracing::info!("BatchLock enabled against Redis");
+                Some(lock)
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to initialize BatchLock, continuing without it: {e}"
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
     // Bridge state: shares the DB pool and the Allbridge API client.
     let bridge_state =
         api::bridge::BridgeState::new(pool.clone(), config.allbridge_api_url.clone());
 
-    // Health check state: pool + Soroban RPC URL for live component probing.
+    // Health check state: pool + Soroban RPC URL + Redis for live component probing.
     let health_state = HealthState {
         pool: pool.clone(),
         stellar_rpc_url: config.stellar_rpc_url.clone(),
+        redis_url: config.redis_url.clone(),
     };
 
     // Setup routes
     let public_routes = Router::new()
         .route("/health", get(health_check))
+        .route("/healthz", get(liveness_probe))
+        .route("/readyz", get(readiness_probe))
+        .route("/api/v1/config", get(app_config))
         .with_state(health_state);
 
     let sensitive_routes = Router::new()
-        .nest("/api/auth", api::auth_routes(pool.clone()))
+        .nest(
+            "/api/auth",
+            api::auth_routes_with_limiter(
+                api::auth::AuthState {
+                    pool: pool.clone(),
+                    privy: Arc::new(api::privy_jwks::PrivyJwksClient::new(
+                        config.privy_jwks_url.clone(),
+                    )),
+                    privy_app_id: config.privy_app_id.clone(),
+                    cache: Some(auth_cache.clone()),
+                },
+                // #949: Redis sliding window shared across API instances.
+                api::auth::AuthRateLimiter::from_redis_url(config.redis_url.as_deref()),
+            ),
+        )
         .nest(
             "/api/users",
             api::user_routes_with_state(api::user::UserState::new(
                 pool.clone(),
                 username_address_cache.clone(),
             )),
-        );
+        )
+        .nest("/admin", api::admin_routes(pool.clone()))
+        .nest("/api/payouts", api::payout_webhook_routes(pool.clone()));
 
-    let other_routes = Router::new()
-        .nest("/api/feed", api::feed_routes(pool.clone()))
-        .nest("/api/social", api::social_routes(pool.clone()))
-        .nest("/api/bridge", api::bridge_routes(bridge_state.clone()))
-        .nest(
-            "/api/yield",
-            api::yield_routes_with_state(api::r#yield::YieldState::new(
-                pool.clone(),
-                yield_cache.clone(),
-            )),
-        );
+    // #561 — routes that require a valid Privy JWT are wrapped with the auth
+    // middleware so the token is validated (and cached) before any handler runs.
+    // Bearer tokens are verified against dynamically fetched Privy JWKS.
+    let privy_jwks = Arc::new(api::privy_jwks::PrivyJwksClient::new(
+        config.privy_jwks_url.clone(),
+    ));
+    let auth_required_routes = api::protected_routes(
+        Router::new()
+            .nest("/api/feed", api::feed_routes(pool.clone()))
+            .nest("/api/social", api::social_routes(pool.clone()))
+            .nest("/api/bridge", api::bridge_routes(bridge_state.clone()))
+            .nest("/api/registry", api::registry_routes(pool.clone()))
+            .nest(
+                "/api/yield",
+                api::yield_routes_with_state(api::r#yield::YieldState::new(
+                    pool.clone(),
+                    yield_cache.clone(),
+                )),
+            )
+            .nest("/api/payouts", api::payout_routes(bridge_state.clone())),
+        pool.clone(),
+        auth_cache.clone(),
+        privy_jwks,
+        config.privy_app_id.clone(),
+    );
+
+    let other_routes = auth_required_routes;
+
+    // #950: Live Soroban ledger events, polled from getEvents (with Horizon
+    // failover) and fanned out to WebSocket clients via a broadcast channel.
+    let (event_broadcaster, event_streamer_handle) =
+        indexer::soroban::spawn(config.stellar_rpc_url.clone());
+    let event_stream_routes = Router::new()
+        .route("/api/events/ws", get(indexer::soroban::ws_handler))
+        .with_state(event_broadcaster);
 
     let app = Router::new()
         .merge(public_routes)
@@ -259,6 +368,7 @@ async fn main() {
             rate_limiter_middleware,
         )))
         .merge(other_routes)
+        .merge(event_stream_routes)
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(|request: &Request<_>| {
@@ -298,63 +408,132 @@ async fn main() {
                         );
                     },
                 ),
-        );
+        )
+        .layer(cors_layer(&config.cors_allowed_origins));
+
+    // #726 — Keep background worker tasks alive for the lifetime of the server.
+    let mut worker_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+    worker_handles.push(event_streamer_handle);
 
     // Spawn indexer in the background
     let indexer_pool = pool.clone();
     let indexer_rpc_url = config.stellar_rpc_url.clone();
     let indexer_cache = yield_cache.clone();
-    tokio::spawn(async move {
+    worker_handles.push(tokio::spawn(async move {
         if let Err(e) = indexer::worker::run(indexer_pool, indexer_rpc_url, indexer_cache).await {
             tracing::error!("Stellar Indexer background worker failed: {:?}", e);
         }
-    });
+    }));
 
     // Spawn the bridge status poller to periodically refresh pending cross-chain deposits.
-    tokio::spawn(async move {
+    worker_handles.push(tokio::spawn(async move {
         api::bridge::run_status_poller(bridge_state).await;
-    });
+    }));
 
     // BE-029: Auto-sweep idle stablecoins for users with auto-earn enabled.
     let sweep_pool = pool.clone();
     let sweep_config = services::sweep_worker::SweepWorkerConfig::from_env();
-    tokio::spawn(async move {
+    worker_handles.push(tokio::spawn(async move {
         services::sweep_worker::run(sweep_pool, sweep_config).await;
-    });
+    }));
+
+    // #737: Alert the operations channel when a user's auto-sweep keeps failing.
+    let sweep_alert_pool = pool.clone();
+    let sweep_alert_config = services::sweep_scheduler::SweepSchedulerConfig::from_env();
+    worker_handles.push(tokio::spawn(async move {
+        services::sweep_scheduler::run(sweep_alert_pool, sweep_alert_config).await;
+    }));
 
     // BE-547: Hourly APY checkpoints into yield_rates_history, so the series
     // every yield estimate is priced against has a guaranteed cadence.
     let checkpoint_pool = pool.clone();
     let checkpoint_config = services::sweep_worker::YieldCheckpointConfig::from_env();
-    tokio::spawn(async move {
+    worker_handles.push(tokio::spawn(async move {
         services::sweep_worker::run_yield_checkpoints(checkpoint_pool, checkpoint_config).await;
-    });
+    }));
 
     // BE-032: Daily / weekly yield report push notifications.
     let notification_pool = pool.clone();
     let notification_config = services::notifications::NotificationSchedulerConfig::from_env();
-    tokio::spawn(async move {
+    worker_handles.push(tokio::spawn(async move {
         services::notifications::run(notification_pool, notification_config).await;
+    }));
+
+    // BE-554 / Issue #936: Background queue worker processing bulk disbursement requests asynchronously
+    let disbursement_pool = pool.clone();
+    let disbursement_config = services::disbursement_worker::DisbursementWorkerConfig::from_env();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let disbursement_handle = tokio::spawn(async move {
+        services::disbursement_worker::run(disbursement_pool, disbursement_config, shutdown_rx)
+            .await;
     });
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     tracing::info!("Listening on {}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    // `into_make_service_with_connect_info` populates `ConnectInfo<SocketAddr>`
+    // on every request so IP-based rate limiting (auth::auth_rate_limit,
+    // rate_limiter_middleware) has a real peer address to fall back on when
+    // there's no `X-Forwarded-For` header (i.e. no reverse proxy in front).
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    );
+
+    tokio::select! {
+        result = server => {
+            if let Err(error) = result {
+                tracing::error!("HTTP server stopped: {error}");
+            }
+        }
+        result = tokio::signal::ctrl_c() => {
+            match result {
+                Ok(()) => tracing::info!("Shutdown signal received"),
+                Err(error) => tracing::error!("Failed to listen for shutdown signal: {error}"),
+            }
+        }
+    }
+
+    let _ = shutdown_tx.send(());
+    if let Err(error) = disbursement_handle.await {
+        tracing::error!("Disbursement worker task failed during shutdown: {error}");
+    }
+}
+
+// ── /api/v1/config — mobile minimum-version gate (#805) ───────────────────────
+
+#[derive(Serialize)]
+struct AppConfigResponse {
+    minimum_required_version: String,
+    ios_store_url: String,
+    android_store_url: String,
+}
+
+async fn app_config() -> Json<AppConfigResponse> {
+    Json(AppConfigResponse {
+        minimum_required_version: std::env::var("MIN_APP_VERSION")
+            .unwrap_or_else(|_| "1.0.0".into()),
+        ios_store_url: std::env::var("IOS_STORE_URL")
+            .unwrap_or_else(|_| "https://apps.apple.com/app/zaps".into()),
+        android_store_url: std::env::var("ANDROID_STORE_URL")
+            .unwrap_or_else(|_| "https://play.google.com/store/apps/details?id=app.zaps".into()),
+    })
 }
 
 // ── /health handler ───────────────────────────────────────────────────────────
 
 async fn health_check(State(state): State<HealthState>) -> impl IntoResponse {
-    // Run all three probes concurrently so latencies don't stack.
-    let (db, yield_db, rpc) = tokio::join!(
+    // Run all probes concurrently so latencies don't stack.
+    let (db, yield_db, rpc, redis) = tokio::join!(
         probe_database(&state.pool),
         probe_yield_db(&state.pool),
         probe_soroban_rpc(&state.stellar_rpc_url),
+        probe_redis(state.redis_url.as_deref()),
     );
 
-    let all_ok = db.status == "ok" && yield_db.status == "ok" && rpc.status == "ok";
+    let all_ok =
+        db.status == "ok" && yield_db.status == "ok" && rpc.status == "ok" && redis.status == "ok";
 
     let body = HealthResponse {
         status: if all_ok { "ok" } else { "degraded" },
@@ -362,6 +541,7 @@ async fn health_check(State(state): State<HealthState>) -> impl IntoResponse {
             database: db,
             yield_db,
             soroban_rpc: rpc,
+            redis,
         },
         checked_at: Utc::now().to_rfc3339(),
     };
@@ -371,6 +551,46 @@ async fn health_check(State(state): State<HealthState>) -> impl IntoResponse {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
+
+    (code, Json(body))
+}
+
+/// GET /healthz — lightweight liveness probe for Kubernetes.
+/// Returns 200 if the process is alive; does not check dependencies.
+async fn liveness_probe() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// GET /readyz — Kubernetes readiness probe.
+/// Verifies DB and Redis are reachable; returns HTTP 200 only when both pass.
+async fn readiness_probe(State(state): State<HealthState>) -> impl IntoResponse {
+    let (db, redis) = tokio::join!(
+        probe_database(&state.pool),
+        probe_redis(state.redis_url.as_deref()),
+    );
+
+    let db_ok = db.status == "ok";
+    let redis_ok = redis.status == "ok" || state.redis_url.is_none();
+
+    let status = if db_ok && redis_ok { "ok" } else { "not ready" };
+    let code = if db_ok && redis_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    let mut body = serde_json::json!({
+        "status": status,
+        "db": db_ok,
+        "redis": redis_ok,
+    });
+
+    if let Some(e) = &db.error {
+        body["db_error"] = serde_json::json!(e);
+    }
+    if let Some(e) = &redis.error {
+        body["redis_error"] = serde_json::json!(e);
+    }
 
     (code, Json(body))
 }
@@ -492,5 +712,231 @@ async fn probe_soroban_rpc(rpc_url: &str) -> RpcHealth {
             latest_ledger: None,
             error: Some(e),
         },
+    }
+}
+
+/// Redis PING probe. Returns "ok" when Redis responds with PONG.
+async fn probe_redis(redis_url: Option<&str>) -> RedisHealth {
+    let start = Instant::now();
+
+    let Some(url) = redis_url else {
+        return RedisHealth {
+            status: "skipped",
+            latency_ms: 0,
+            error: None,
+        };
+    };
+
+    let result: Result<(), String> = async {
+        let client = redis::Client::open(url).map_err(|e| e.to_string())?;
+        let mut conn = redis::aio::ConnectionManager::new(client)
+            .await
+            .map_err(|e| e.to_string())?;
+        redis::cmd("PING")
+            .query_async::<String>(&mut conn)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    .await;
+
+    let latency_ms = start.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(()) => RedisHealth {
+            status: "ok",
+            latency_ms,
+            error: None,
+        },
+        Err(e) => RedisHealth {
+            status: "error",
+            latency_ms,
+            error: Some(e),
+        },
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::liveness_probe;
+    use axum::{body::Body, http::{Request, StatusCode}, routing::get, Router};
+    use tower::ServiceExt;
+
+    fn liveness_router() -> Router {
+        Router::new().route("/healthz", get(liveness_probe))
+    }
+
+    #[tokio::test]
+    async fn liveness_probe_returns_200() {
+        let response = liveness_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn liveness_probe_body_contains_status_ok() {
+        let response = liveness_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn liveness_probe_response_is_json() {
+        let response = liveness_router()
+            .oneshot(
+                Request::builder()
+                    .uri("/healthz")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let content_type = response
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+
+        assert!(content_type.contains("application/json"), "expected JSON content-type, got {content_type}");
+    }
+}
+
+#[cfg(test)]
+mod cors_tests {
+    use super::cors_layer;
+    use axum::{
+        body::Body,
+        http::{header, HeaderValue, Method, Request, StatusCode},
+        routing::get,
+        Router,
+    };
+    use tower::ServiceExt;
+    use tower_http::cors::CorsLayer;
+
+    const ALLOWED: &str = "http://localhost:3000";
+    const DENIED: &str = "http://evil.example.com";
+
+    fn router(layer: CorsLayer) -> Router {
+        Router::new()
+            .route("/", get(|| async { "pong" }))
+            .layer(layer)
+    }
+
+    fn simple_get(origin: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(header::ORIGIN, origin)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn preflight(origin: &str, requested_method: &str) -> Request<Body> {
+        Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/")
+            .header(header::ORIGIN, origin)
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, requested_method)
+            .header(
+                header::ACCESS_CONTROL_REQUEST_HEADERS,
+                "authorization, content-type",
+            )
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn allow_origin_header(response: &axum::response::Response) -> Option<HeaderValue> {
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .cloned()
+    }
+
+    #[tokio::test]
+    async fn whitelisted_origin_is_allowed() {
+        let layer = cors_layer(&[ALLOWED.to_string()]);
+        let response = router(layer).oneshot(simple_get(ALLOWED)).await.unwrap();
+
+        assert_eq!(
+            allow_origin_header(&response),
+            Some(HeaderValue::from_static(ALLOWED))
+        );
+    }
+
+    #[tokio::test]
+    async fn non_whitelisted_origin_gets_no_cors_headers() {
+        let layer = cors_layer(&[ALLOWED.to_string()]);
+        let response = router(layer).oneshot(simple_get(DENIED)).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(allow_origin_header(&response), None);
+    }
+
+    #[tokio::test]
+    async fn preflight_from_whitelisted_origin_is_allowed() {
+        let layer = cors_layer(&[ALLOWED.to_string()]);
+        let response = router(layer)
+            .oneshot(preflight(ALLOWED, "GET"))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            allow_origin_header(&response),
+            Some(HeaderValue::from_static(ALLOWED))
+        );
+        let allow_methods = response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_METHODS)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(allow_methods.contains("GET"));
+        assert!(allow_methods.contains("POST"));
+    }
+
+    #[tokio::test]
+    async fn preflight_from_denied_origin_is_rejected() {
+        let layer = cors_layer(&[ALLOWED.to_string()]);
+        let response = router(layer)
+            .oneshot(preflight(DENIED, "GET"))
+            .await
+            .unwrap();
+
+        assert_eq!(allow_origin_header(&response), None);
+    }
+
+    #[tokio::test]
+    async fn invalid_origin_entries_are_skipped() {
+        let layer = cors_layer(&[
+            "http://localhost:3000".to_string(),
+            "not a header".to_string(),
+        ]);
+        let response = router(layer).oneshot(simple_get(ALLOWED)).await.unwrap();
+
+        assert_eq!(
+            allow_origin_header(&response),
+            Some(HeaderValue::from_static(ALLOWED))
+        );
     }
 }

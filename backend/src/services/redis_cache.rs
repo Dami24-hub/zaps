@@ -89,6 +89,84 @@ impl UsernameAddressCache {
     }
 }
 
+/// Default lock TTL in milliseconds (5 minutes).
+const BATCH_LOCK_TTL_MS: u64 = 5 * 60 * 1000;
+
+/// Distributed lock for payout batch processing.
+///
+/// Uses Redis `SET key value NX PX ttl` to ensure only one worker
+/// processes a given batch at a time across multiple backend instances.
+#[derive(Clone)]
+pub struct BatchLock {
+    pool: ConnectionManager,
+}
+
+impl BatchLock {
+    pub fn connect(redis_url: &str) -> Result<Self, RedisError> {
+        let client = redis::Client::open(redis_url)?;
+        let config = ConnectionManagerConfig::new()
+            .set_connection_timeout(Some(CONNECT_TIMEOUT))
+            .set_response_timeout(Some(RESPONSE_TIMEOUT));
+
+        Ok(Self {
+            pool: ConnectionManager::new_lazy_with_config(client, config)?,
+        })
+    }
+
+    /// Generates the Redis lock key for a batch ID.
+    pub fn lock_key(batch_id: &str) -> String {
+        format!("lock:batch:{batch_id}")
+    }
+
+    /// Attempt to acquire a distributed lock for `batch_id`.
+    ///
+    /// Returns `Ok(true)` if the lock was acquired, `Ok(false)` if another
+    /// worker already holds it. The lock auto-expires after `ttl_ms`
+    /// milliseconds to prevent deadlocks if the holder crashes.
+    pub async fn acquire(&self, batch_id: &str, ttl_ms: Option<u64>) -> Result<bool, RedisError> {
+        let key = Self::lock_key(batch_id);
+        let ttl = ttl_ms.unwrap_or(BATCH_LOCK_TTL_MS);
+        let value = std::process::id().to_string();
+
+        let result: Option<String> = redis::cmd("SET")
+            .arg(&key)
+            .arg(&value)
+            .arg("NX")
+            .arg("PX")
+            .arg(ttl)
+            .query_async(&mut self.pool.clone())
+            .await?;
+
+        Ok(result.is_some())
+    }
+
+    /// Release a previously acquired lock. Only succeeds if the caller
+    /// still owns it (value matches our PID).
+    pub async fn release(&self, batch_id: &str) -> Result<(), RedisError> {
+        let key = Self::lock_key(batch_id);
+        let value = std::process::id().to_string();
+
+        // Lua script: compare-and-delete to avoid releasing someone else's lock.
+        let script = redis::Script::new(
+            r#"
+            if redis.call("GET", KEYS[1]) == ARGV[1] then
+                return redis.call("DEL", KEYS[1])
+            else
+                return 0
+            end
+            "#,
+        );
+
+        script
+            .key(key)
+            .arg(value)
+            .invoke_async::<()>(&mut self.pool.clone())
+            .await?;
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +180,35 @@ mod tests {
     #[test]
     fn connect_rejects_a_non_redis_url() {
         assert!(UsernameAddressCache::connect("postgres://localhost/zaps").is_err());
+    }
+
+    #[test]
+    fn batch_lock_key_formats_correctly() {
+        assert_eq!(BatchLock::lock_key("123"), "lock:batch:123");
+        assert_eq!(
+            BatchLock::lock_key("d290f1ee-6c54-4b01-90e6-d701748f0851"),
+            "lock:batch:d290f1ee-6c54-4b01-90e6-d701748f0851"
+        );
+    }
+
+    #[test]
+    fn batch_lock_connect_rejects_invalid_url() {
+        assert!(BatchLock::connect("invalid-url").is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_key_format() {
+        assert_eq!(cache_key("alice"), "zaps:user:address:alice");
+        assert_eq!(cache_key("bob123"), "zaps:user:address:bob123");
+    }
+
+    #[test]
+    fn ttl_is_30_minutes() {
+        assert_eq!(USERNAME_ADDRESS_TTL_SECS, 1800);
     }
 }

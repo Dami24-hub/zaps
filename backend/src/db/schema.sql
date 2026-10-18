@@ -8,6 +8,8 @@ CREATE TABLE IF NOT EXISTS users (
     display_name VARCHAR(100),
     bio VARCHAR(255),
     avatar_url TEXT,
+    privy_did VARCHAR(255) UNIQUE, -- Privy DID; NULL until an identity is linked
+    privy_linked_at TIMESTAMP,
     auto_earn_enabled BOOLEAN NOT NULL DEFAULT false,
     last_daily_yield_report_at TIMESTAMP,
     last_weekly_yield_report_at TIMESTAMP,
@@ -70,6 +72,12 @@ CREATE INDEX IF NOT EXISTS idx_payments_created_at ON payments(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_payments_sender_id ON payments(sender_id);
 CREATE INDEX IF NOT EXISTS idx_payments_receiver_id ON payments(receiver_id);
 CREATE INDEX IF NOT EXISTS idx_users_display_name ON users(display_name);
+CREATE INDEX IF NOT EXISTS idx_users_created_at ON users(created_at DESC);
+-- Privy DID lookup (#560)
+CREATE INDEX IF NOT EXISTS idx_users_privy_did ON users(privy_did) WHERE privy_did IS NOT NULL;
+-- Username registry (#541): case-insensitive uniqueness + prefix search
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username_lower ON users(LOWER(username));
+CREATE INDEX IF NOT EXISTS idx_users_username_lower_pattern ON users(LOWER(username) text_pattern_ops);
 CREATE INDEX IF NOT EXISTS idx_bridge_tx_status ON bridge_transactions(status);
 CREATE INDEX IF NOT EXISTS idx_bridge_tx_created_at ON bridge_transactions(created_at DESC);
 
@@ -107,10 +115,21 @@ CREATE TABLE IF NOT EXISTS yield_rates_history (
     created_at TIMESTAMP NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS yield_snapshots (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    earning_balance BIGINT NOT NULL,
+    accrued_interest BIGINT NOT NULL,
+    apy INTEGER NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_yield_tx_user_id ON yield_transactions(user_id);
 CREATE INDEX IF NOT EXISTS idx_yield_tx_created_at ON yield_transactions(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_yield_rates_created_at ON yield_rates_history(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_yield_snapshots_user_id ON yield_snapshots(user_id);
+CREATE INDEX IF NOT EXISTS idx_yield_snapshots_created_at ON yield_snapshots(created_at DESC);
 
 -- Bulk Disbursement Tables (BE-555)
 --
@@ -191,3 +210,16 @@ CREATE INDEX IF NOT EXISTS idx_batch_recipients_locked
 CREATE INDEX IF NOT EXISTS idx_dispatch_logs_batch ON dispatch_logs(batch_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_dispatch_logs_recipient
     ON dispatch_logs(recipient_id, created_at DESC) WHERE recipient_id IS NOT NULL;
+
+-- #806: Dead-letter queue for permanently failing push/webhook dispatches.
+CREATE TABLE IF NOT EXISTS failed_webhook_dlq (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    destination TEXT NOT NULL,
+    payload JSONB NOT NULL,
+    error_message TEXT NOT NULL,
+    retry_count INTEGER NOT NULL DEFAULT 5 CHECK (retry_count >= 0),
+    created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_failed_webhook_dlq_created_at
+    ON failed_webhook_dlq(created_at DESC);

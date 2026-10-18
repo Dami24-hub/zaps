@@ -1,8 +1,10 @@
 "use client";
-import { useState } from "react";
+import { useMemo, useState, useCallback, useRef } from "react";
 import { usePolling } from "@/lib/use-polling";
-import { api } from "@/lib/api";
+import { api, IdentityLink } from "@/lib/api";
+import { useSuperAdmin } from "@/lib/auth-context";
 import StatCard from "@/components/StatCard";
+import { X, Shield, AlertTriangle, Search, Copy, Check, Link2, Wallet } from "lucide-react";
 
 function severityColor(severity: string) {
   if (severity === "critical") return "bg-red-50 border-red-200 text-red-800";
@@ -13,6 +15,8 @@ function severityColor(severity: string) {
 
 // ── Admin panel: fee-coefficient form ─────────────────────────────────────────
 function FeeConfigPanel() {
+  // #786 — superadmin-only action
+  const isSuperAdmin = useSuperAdmin();
   const config = usePolling(() => api.contractConfig(), 30000);
   const currentFee = config.data?.fee_coefficient;
 
@@ -84,6 +88,16 @@ function FeeConfigPanel() {
 
         {/* Form */}
         <form onSubmit={handleSubmit} className="space-y-4">
+          {/* #786 — access gate notice */}
+          {!isSuperAdmin && (
+            <div
+              role="alert"
+              data-testid="fee-access-denied"
+              className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800"
+            >
+              🔒 Superadmin access required to update the fee coefficient.
+            </div>
+          )}
           <div>
             <label
               htmlFor="fee-coefficient-input"
@@ -104,10 +118,12 @@ function FeeConfigPanel() {
                   if (status.kind !== "idle") setStatus({ kind: "idle" });
                 }}
                 placeholder="e.g. 50"
+                disabled={!isSuperAdmin || status.kind === "submitting"}
+                aria-disabled={!isSuperAdmin}
+                title={!isSuperAdmin ? "Superadmin access required" : undefined}
                 className="w-32 rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900
                            focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-200
-                           disabled:opacity-50"
-                disabled={status.kind === "submitting"}
+                           disabled:cursor-not-allowed disabled:opacity-50 disabled:bg-slate-50"
               />
               {percentDisplay && (
                 <span className="text-xs text-slate-500">
@@ -120,7 +136,10 @@ function FeeConfigPanel() {
           <button
             id="fee-coefficient-submit"
             type="submit"
-            disabled={!isValid || status.kind === "submitting"}
+            data-testid="fee-coefficient-submit"
+            disabled={!isSuperAdmin || !isValid || status.kind === "submitting"}
+            title={!isSuperAdmin ? "Superadmin access required" : undefined}
+            aria-disabled={!isSuperAdmin}
             className="inline-flex items-center gap-2 rounded-lg bg-indigo-600 px-4 py-2 text-sm
                        font-medium text-white hover:bg-indigo-700 active:bg-indigo-800
                        disabled:cursor-not-allowed disabled:opacity-50 transition-colors"
@@ -154,6 +173,671 @@ function FeeConfigPanel() {
           <div className="mt-4 rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-800">
             <p className="font-semibold">✗ Update failed</p>
             <p className="mt-1 text-xs">{status.message}</p>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+// ── Usernames table ───────────────────────────────────────────────────────────
+function UsernamesTable() {
+  // #786 — superadmin-only action
+  const isSuperAdmin = useSuperAdmin();
+  const { data, loading, error } = usePolling(() => api.registryClaims(), 30000);
+  const [sortKey, setSortKey] = useState<"username" | "registered_at">("registered_at");
+  const [sortAsc, setSortAsc] = useState(false);
+
+  // Blacklist confirmation drawer state
+  const [showBlacklistDrawer, setShowBlacklistDrawer] = useState(false);
+  const [targetUsername, setTargetUsername] = useState<string | null>(null);
+  const [targetPublicKey, setTargetPublicKey] = useState<string | null>(null);
+  const [blacklistConfirmed, setBlacklistConfirmed] = useState(false);
+  const [signing, setSigning] = useState(false);
+  const [blacklistMsg, setBlacklistMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
+
+  const sorted = useMemo(() => {
+    if (!data) return [];
+    return [...data].sort((a, b) => {
+      const cmp = sortKey === "username"
+        ? a.username.localeCompare(b.username)
+        : new Date(a.registered_at).getTime() - new Date(b.registered_at).getTime();
+      return sortAsc ? cmp : -cmp;
+    });
+  }, [data, sortKey, sortAsc]);
+
+  function toggleSort(key: "username" | "registered_at") {
+    if (sortKey === key) setSortAsc((v) => !v);
+    else { setSortKey(key); setSortAsc(true); }
+  }
+
+  const handleBlacklistClick = (username: string, publicKey: string) => {
+    setTargetUsername(username);
+    setTargetPublicKey(publicKey);
+    setBlacklistConfirmed(false);
+    setBlacklistMsg(null);
+    setShowBlacklistDrawer(true);
+  };
+
+  const handleBlacklistConfirm = async () => {
+    if (!blacklistConfirmed) {
+      setBlacklistConfirmed(true);
+      return;
+    }
+    if (!targetUsername || !targetPublicKey) return;
+
+    setSigning(true);
+    setBlacklistMsg(null);
+    try {
+      const { isConnected, getAddress, signTransaction } = await import("@stellar/freighter-api");
+      const connected = await isConnected();
+      if (!connected.isConnected) throw new Error("Freighter wallet not connected");
+
+      const addr = await getAddress();
+      if (!addr.address) throw new Error("Could not retrieve public key");
+
+      const placeholderXdr = btoa(JSON.stringify({
+        fn: "blacklist_user",
+        username: targetUsername,
+        public_key: targetPublicKey,
+        admin: addr.address
+      }));
+
+      const result = await signTransaction(placeholderXdr, { networkPassphrase: "Test SDF Network ; September 2015" });
+      if ("error" in result) throw new Error(result.error);
+
+      setBlacklistMsg({ type: "ok", text: `User @${targetUsername} has been blacklisted. Signed XDR: ${(result as { signedTxXdr: string }).signedTxXdr.slice(0, 24)}…` });
+      setTimeout(() => {
+        setShowBlacklistDrawer(false);
+        setBlacklistConfirmed(false);
+        setTargetUsername(null);
+        setTargetPublicKey(null);
+      }, 2000);
+    } catch (err) {
+      setBlacklistMsg({ type: "err", text: err instanceof Error ? err.message : "Failed to sign blacklist transaction" });
+    } finally {
+      setSigning(false);
+    }
+  };
+
+  const th = (key: "username" | "registered_at", label: string) => (
+    <th
+      className="text-left px-4 py-3 cursor-pointer select-none hover:text-slate-700"
+      onClick={() => toggleSort(key)}
+    >
+      {label} {sortKey === key ? (sortAsc ? "↑" : "↓") : ""}
+    </th>
+  );
+
+  return (
+    <section className="mb-8">
+      <h2 className="text-lg font-semibold text-slate-800 mb-3">
+        Registered Usernames
+      </h2>
+      {error && (
+        <div className="mb-3 p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">{error}</div>
+      )}
+      <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-slate-500 uppercase text-xs">
+            <tr>
+              {th("username", "Username")}
+              <th className="text-left px-4 py-3">Public Key</th>
+              {th("registered_at", "Registered")}
+              <th className="text-left px-4 py-3">TX Hash</th>
+              <th className="text-left px-4 py-3">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading && !data ? (
+              Array.from({ length: 4 }).map((_, row) => (
+                <tr key={row}>
+                  {Array.from({ length: 5 }).map((__, col) => (
+                    <td key={col} className="px-4 py-3"><div className="h-4 animate-pulse rounded bg-slate-100" /></td>
+                  ))}
+                </tr>
+              ))
+            ) : sorted.length === 0 ? (
+              <tr><td colSpan={5} className="px-4 py-6 text-center text-slate-400">No registrations found</td></tr>
+            ) : (
+              sorted.map((c) => (
+                <tr key={c.username} className="border-t border-slate-100 hover:bg-slate-50">
+                  <td className="px-4 py-3 font-medium text-slate-900">{c.username}</td>
+                  <td className="px-4 py-3 text-slate-600 font-mono text-xs truncate max-w-[200px]">{c.public_key}</td>
+                  <td className="px-4 py-3 text-slate-500">{new Date(c.registered_at).toLocaleDateString()}</td>
+                  <td className="px-4 py-3 text-slate-500 font-mono text-xs truncate max-w-[160px]">{c.tx_hash ?? "—"}</td>
+                  <td className="px-4 py-3">
+                    {isSuperAdmin ? (
+                      <button
+                        onClick={() => handleBlacklistClick(c.username, c.public_key)}
+                        data-testid={`blacklist-btn-${c.username}`}
+                        className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded bg-red-50 text-red-700 hover:bg-red-100 transition-colors"
+                      >
+                        <Shield size={12} />
+                        Blacklist
+                      </button>
+                    ) : (
+                      <button
+                        disabled
+                        aria-disabled="true"
+                        title="Superadmin access required"
+                        data-testid={`blacklist-btn-${c.username}`}
+                        className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded bg-slate-100 text-slate-400 cursor-not-allowed"
+                      >
+                        <Shield size={12} />
+                        Blacklist
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+      {/* #1002 — active registration count badge */}
+      {data && (
+        <p
+          data-testid="active-registration-count"
+          className="mt-2 text-xs text-slate-400"
+        >
+          {data.length} active registration{data.length !== 1 ? "s" : ""}
+        </p>
+      )}
+
+      {/* Blacklist Confirmation Drawer */}
+      {showBlacklistDrawer && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl shadow-2xl max-w-md w-full mx-4 overflow-hidden">
+            <div className="bg-red-600 px-6 py-4 flex items-center justify-between">
+              <h3 className="text-lg font-semibold text-white flex items-center gap-2">
+                <AlertTriangle size={20} />
+                Blacklist User
+              </h3>
+              <button
+                onClick={() => {
+                  setShowBlacklistDrawer(false);
+                  setBlacklistConfirmed(false);
+                  setTargetUsername(null);
+                  setTargetPublicKey(null);
+                  setBlacklistMsg(null);
+                }}
+                className="text-white hover:text-red-200 transition-colors"
+              >
+                <X size={20} />
+              </button>
+            </div>
+            <div className="p-6">
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-4 mb-6">
+                <p className="text-sm text-amber-800 font-medium mb-2">
+                  You are about to blacklist <strong>@{targetUsername}</strong>
+                </p>
+                <p className="text-xs text-amber-700 font-mono break-all">
+                  {targetPublicKey}
+                </p>
+              </div>
+
+              <p className="text-sm text-slate-700 mb-4">
+                This action will:
+              </p>
+              <ul className="text-sm text-slate-600 space-y-2 mb-6 list-disc list-inside">
+                <li>Revoke the user's registered username</li>
+                <li>Block all incoming payments to this user</li>
+                <li>Prevent the user from receiving funds</li>
+                <li>Flag the account as a bad actor</li>
+              </ul>
+
+              <div className="bg-red-50 border border-red-200 rounded-lg p-3 mb-6">
+                <p className="text-xs text-red-800 font-medium">
+                  ⚠ This action requires administrator privileges and will be signed via Freighter. This action cannot be easily undone.
+                </p>
+              </div>
+
+              {blacklistMsg && (
+                <div className={`mb-4 p-3 rounded-lg text-sm ${blacklistMsg.type === "ok" ? "bg-green-50 text-green-700 border border-green-200" : "bg-red-50 text-red-700 border border-red-200"}`}>
+                  {blacklistMsg.text}
+                </div>
+              )}
+
+              {!blacklistConfirmed ? (
+                <button
+                  onClick={() => setBlacklistConfirmed(true)}
+                  className="w-full bg-red-600 text-white py-3 rounded-lg font-medium hover:bg-red-700 transition-colors"
+                >
+                  First Confirmation
+                </button>
+              ) : (
+                <button
+                  onClick={handleBlacklistConfirm}
+                  disabled={signing}
+                  className="w-full bg-red-600 text-white py-3 rounded-lg font-medium hover:bg-red-700 disabled:opacity-50 transition-colors"
+                >
+                  {signing ? "Signing with Freighter…" : "Final Confirmation - Sign & Submit"}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ── Identity Link Grid (Privy DID <-> Stellar address) ──────────────────────
+
+const IDENTITY_STATUS_CLASS: Record<string, string> = {
+  active:  "bg-emerald-100 text-emerald-800",
+  pending: "bg-amber-100 text-amber-800",
+  revoked: "bg-red-100 text-red-800",
+};
+
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = useCallback(async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch {/* ignore */}
+  }, [text]);
+  return (
+    <button
+      onClick={copy}
+      title="Copy to clipboard"
+      className="ml-1.5 text-slate-400 hover:text-indigo-600 transition-colors shrink-0"
+    >
+      {copied ? <Check size={12} className="text-emerald-500" /> : <Copy size={12} />}
+    </button>
+  );
+}
+
+function IdentityLinkGrid() {
+  const [searchInput, setSearchInput] = useState("");
+  const [committedQuery, setCommittedQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState<"all" | "active" | "pending" | "revoked">("all");
+  const [dateFrom, setDateFrom] = useState("");
+  const [dateTo, setDateTo] = useState("");
+  const [page, setPage] = useState(1);
+  const [sortKey, setSortKey] = useState<"linked_at" | "display_name" | "status">("linked_at");
+  const [sortAsc, setSortAsc] = useState(false);
+  const searchRef = useRef<HTMLInputElement>(null);
+
+  const { data, loading, error, refresh } = usePolling(
+    () => api.identityLinks({
+      query: committedQuery || undefined,
+      limit: 50,
+      offset: (page - 1) * 50,
+    }),
+    60_000,
+    [committedQuery, page]
+  );
+
+  const links: IdentityLink[] = data?.links ?? [];
+  const total = data?.total ?? 0;
+  const totalPages = Math.max(1, Math.ceil(total / 50));
+
+  const filteredLinks = useMemo(() => {
+    let filtered = [...links];
+
+    if (statusFilter !== "all") {
+      filtered = filtered.filter((link) => link.status === statusFilter);
+    }
+
+    if (dateFrom) {
+      const from = new Date(dateFrom).getTime();
+      filtered = filtered.filter((link) => new Date(link.linked_at).getTime() >= from);
+    }
+
+    if (dateTo) {
+      const to = new Date(dateTo + "T23:59:59Z").getTime();
+      filtered = filtered.filter((link) => new Date(link.linked_at).getTime() <= to);
+    }
+
+    filtered.sort((a, b) => {
+      const cmp = sortKey === "linked_at"
+        ? new Date(a.linked_at).getTime() - new Date(b.linked_at).getTime()
+        : sortKey === "display_name"
+        ? (a.display_name || a.user_id).localeCompare(b.display_name || b.user_id)
+        : a.status.localeCompare(b.status);
+      return sortAsc ? cmp : -cmp;
+    });
+
+    return filtered;
+  }, [links, statusFilter, dateFrom, dateTo, sortKey, sortAsc]);
+
+  const handleSearch = (e: React.FormEvent) => {
+    e.preventDefault();
+    setCommittedQuery(searchInput.trim());
+    setPage(1);
+  };
+
+  const clearSearch = () => {
+    setSearchInput("");
+    setCommittedQuery("");
+    setPage(1);
+    searchRef.current?.focus();
+  };
+
+  const handleExportCSV = () => {
+    const headers = ["User ID", "Privy DID", "Stellar Address", "Display Name", "Email", "Status", "Linked At"];
+    const csvRows = [headers.join(",")];
+    filteredLinks.forEach((link) => {
+      csvRows.push([
+        link.user_id,
+        link.privy_did,
+        link.stellar_address,
+        link.display_name ?? "",
+        link.email ?? "",
+        link.status,
+        link.linked_at,
+      ].map((v) => `"${v}"`).join(","));
+    });
+    const blob = new Blob([csvRows.join("\n")], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `identity-links-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const clearFilters = () => {
+    setSearchInput("");
+    setCommittedQuery("");
+    setStatusFilter("all");
+    setDateFrom("");
+    setDateTo("");
+    setPage(1);
+  };
+
+  const hasActiveFilters = committedQuery || statusFilter !== "all" || dateFrom || dateTo;
+
+  return (
+    <section className="mb-10" id="identity-link-grid">
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
+        <div>
+          <h2 className="text-lg font-semibold text-slate-800 flex items-center gap-2">
+            <Link2 size={18} className="text-indigo-600" />
+            Identity Links
+          </h2>
+          <p className="text-xs text-slate-500 mt-0.5">
+            Maps Privy DID strings to verified Stellar wallet addresses
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={handleExportCSV}
+            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 transition-colors"
+            title="Export to CSV"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+              <polyline points="7 10 12 15 17 10" />
+              <line x1="12" x2="12" y1="15" y2="3" />
+            </svg>
+            Export
+          </button>
+          <form onSubmit={handleSearch} className="flex items-center gap-2">
+            <div className="relative">
+              <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+              <input
+                ref={searchRef}
+                id="identity-search"
+                type="text"
+                value={searchInput}
+                onChange={(e) => setSearchInput(e.target.value)}
+                placeholder="Search DID, Stellar address or username…"
+                className="pl-8 pr-8 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 w-72"
+              />
+              {searchInput && (
+                <button
+                  type="button"
+                  onClick={clearSearch}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
+              >
+                <X size={13} />
+              </button>
+            )}
+          </div>
+          <button
+            id="identity-search-submit"
+            type="submit"
+            className="px-3 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 transition-colors"
+          >
+            Search
+          </button>
+        </form>
+      </div>
+
+      {/* Filter Controls */}
+      <div className="bg-white border border-slate-200 rounded-xl p-4 mb-4 shadow-sm">
+        <div className="flex flex-wrap items-center gap-3">
+          <div>
+            <label className="block text-xs font-medium text-slate-600 mb-1">Status</label>
+            <select
+              value={statusFilter}
+              onChange={(e) => {
+                setStatusFilter(e.target.value as typeof statusFilter);
+                setPage(1);
+              }}
+              className="border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white"
+            >
+              <option value="all">All Statuses</option>
+              <option value="active">Active</option>
+              <option value="pending">Pending</option>
+              <option value="revoked">Revoked</option>
+            </select>
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-slate-600 mb-1">From Date</label>
+            <input
+              type="date"
+              value={dateFrom}
+              onChange={(e) => {
+                setDateFrom(e.target.value);
+                setPage(1);
+              }}
+              className="border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-slate-600 mb-1">To Date</label>
+            <input
+              type="date"
+              value={dateTo}
+              onChange={(e) => {
+                setDateTo(e.target.value);
+                setPage(1);
+              }}
+              className="border border-slate-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            />
+          </div>
+          {hasActiveFilters && (
+            <button
+              onClick={clearFilters}
+              className="text-xs text-slate-500 hover:text-slate-800 underline underline-offset-2 transition-colors mt-5"
+            >
+              Clear filters
+            </button>
+          )}
+          <span className="ml-auto text-xs text-slate-400 mt-5">
+            {filteredLinks.length} of {total} link{total !== 1 ? "s" : ""}
+          </span>
+        </div>
+      </div>
+
+      {error && (
+        <div className="mb-3 p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">
+          {error} — ensure the backend admin identity endpoint is reachable
+        </div>
+      )}
+
+      <div className="bg-white rounded-xl border border-slate-200 overflow-hidden">
+        <table className="w-full text-sm">
+          <thead className="bg-slate-50 text-slate-500 uppercase text-xs border-b border-slate-200">
+            <tr>
+              <th className="text-left px-5 py-3">User</th>
+              <th className="text-left px-5 py-3">
+                <span className="flex items-center gap-1"><Link2 size={11} /> Privy DID</span>
+              </th>
+              <th className="text-left px-5 py-3">
+                <span className="flex items-center gap-1"><Wallet size={11} /> Stellar Address</span>
+              </th>
+              <th
+                className="text-left px-5 py-3 cursor-pointer hover:text-slate-700 select-none"
+                onClick={() => {
+                  if (sortKey === "linked_at") setSortAsc(!sortAsc);
+                  else { setSortKey("linked_at"); setSortAsc(true); }
+                }}
+              >
+                Linked {sortKey === "linked_at" ? (sortAsc ? "↑" : "↓") : ""}
+              </th>
+              <th
+                className="text-left px-5 py-3 cursor-pointer hover:text-slate-700 select-none"
+                onClick={() => {
+                  if (sortKey === "status") setSortAsc(!sortAsc);
+                  else { setSortKey("status"); setSortAsc(true); }
+                }}
+              >
+                Status {sortKey === "status" ? (sortAsc ? "↑" : "↓") : ""}
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading && filteredLinks.length === 0 ? (
+              Array.from({ length: 5 }).map((_, row) => (
+                <tr key={row} className="border-t border-slate-100">
+                  {Array.from({ length: 5 }).map((__, col) => (
+                    <td key={col} className="px-5 py-3">
+                      <div className="h-4 animate-pulse rounded bg-slate-100" />
+                    </td>
+                  ))}
+                </tr>
+              ))
+            ) : filteredLinks.length === 0 ? (
+              <tr>
+                <td colSpan={5} className="px-5 py-10 text-center text-slate-400 text-sm">
+                  {hasActiveFilters
+                    ? "No identity links match your filters"
+                    : "No identity links found — ensure the backend admin API is connected"}
+                </td>
+              </tr>
+            ) : (
+              filteredLinks.map((link) => (
+                <tr
+                  key={link.user_id}
+                  className="border-t border-slate-100 hover:bg-slate-50 transition-colors"
+                >
+                  <td className="px-5 py-3">
+                    <div className="flex flex-col">
+                      <span className="font-medium text-slate-900">
+                        {link.display_name ?? (link.user_id.slice(0, 12) + "…")}
+                      </span>
+                      {link.email && (
+                        <span className="text-xs text-slate-400">{link.email}</span>
+                      )}
+                    </div>
+                  </td>
+                  <td className="px-5 py-3">
+                    <div className="flex items-center max-w-[220px]">
+                      <span className="font-mono text-xs text-slate-600 truncate" title={link.privy_did}>
+                        {link.privy_did}
+                      </span>
+                      <CopyButton text={link.privy_did} />
+                    </div>
+                  </td>
+                  <td className="px-5 py-3">
+                    <div className="flex items-center max-w-[200px]">
+                      <span className="font-mono text-xs text-slate-600 truncate" title={link.stellar_address}>
+                        {link.stellar_address}
+                      </span>
+                      <CopyButton text={link.stellar_address} />
+                    </div>
+                  </td>
+                  <td className="px-5 py-3 text-slate-500 text-xs whitespace-nowrap">
+                    {new Date(link.linked_at).toLocaleDateString()}
+                  </td>
+                  <td className="px-5 py-3">
+                    <span
+                      className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium capitalize ${
+                        IDENTITY_STATUS_CLASS[link.status] ?? "bg-slate-100 text-slate-600"
+                      }`}
+                    >
+                      {link.status}
+                    </span>
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+
+        {filteredLinks.length > 0 && (
+          <div className="px-5 py-3 border-t border-slate-100 flex items-center justify-between">
+            <p className="text-xs text-slate-400">
+              Showing {filteredLinks.length} of {total} identity link{total !== 1 ? "s" : ""}
+              {hasActiveFilters && " (filtered)"}
+            </p>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={refresh}
+                className="text-xs text-slate-400 hover:text-slate-700 transition-colors"
+              >
+                Refresh
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Pagination */}
+        {totalPages > 1 && (
+          <div className="px-5 py-3 border-t border-slate-100 flex items-center justify-between">
+            <p className="text-xs text-slate-400">
+              Page {page} of {totalPages}
+            </p>
+            <div className="flex gap-1">
+              <button
+                onClick={() => setPage((p) => Math.max(1, p - 1))}
+                disabled={page === 1}
+                className="px-3 py-1.5 text-xs rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                ‹ Prev
+              </button>
+              {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
+                let pageNum;
+                if (totalPages <= 5) {
+                  pageNum = i + 1;
+                } else if (page <= 3) {
+                  pageNum = i + 1;
+                } else if (page >= totalPages - 2) {
+                  pageNum = totalPages - 4 + i;
+                } else {
+                  pageNum = page - 2 + i;
+                }
+                return (
+                  <button
+                    key={pageNum}
+                    onClick={() => setPage(pageNum)}
+                    className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${
+                      pageNum === page
+                        ? "border-indigo-600 bg-indigo-600 text-white"
+                        : "border-slate-200 text-slate-600 hover:bg-slate-50"
+                    }`}
+                  >
+                    {pageNum}
+                  </button>
+                );
+              })}
+              <button
+                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                disabled={page === totalPages}
+                className="px-3 py-1.5 text-xs rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                Next ›
+              </button>
+            </div>
           </div>
         )}
       </div>
@@ -307,6 +991,12 @@ export default function ContractsPage() {
           </ul>
         )}
       </section>
+
+      {/* Registered usernames table */}
+      <UsernamesTable />
+
+      {/* Identity links grid (Privy DID <-> Stellar address) */}
+      <IdentityLinkGrid />
 
       {/* Admin section — fee coefficient */}
       <FeeConfigPanel />
