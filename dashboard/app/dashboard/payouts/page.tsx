@@ -3,11 +3,13 @@ import { useState } from "react";
 import { usePolling } from "@/lib/use-polling";
 import { api, Payout } from "@/lib/api";
 import StatusBadge from "@/components/StatusBadge";
+import BridgeDepositMonitor from "@/components/BridgeDepositMonitor";
 import { format } from "date-fns";
 
 export default function PayoutsPage() {
   const { data, loading, error, refresh } = usePolling(() => api.payoutHistory(20, 0), 30000);
   const payouts: Payout[] = data?.payouts ?? [];
+  const bridge = usePolling(() => api.bridgeDeposits(20), 15000);
 
   const [form, setForm] = useState({ amount: "", asset: "USDC", bankAccountId: "", anchorId: "" });
   const [submitting, setSubmitting] = useState(false);
@@ -126,6 +128,17 @@ export default function PayoutsPage() {
           </tbody>
         </table>
       </div>
+
+      {/* Allbridge cross-chain deposits */}
+      <div className="mt-10 mb-3">
+        <h2 className="font-semibold text-slate-800">Cross-Chain Deposits (Allbridge)</h2>
+        <p className="mt-1 text-sm text-slate-500">Incoming bridge transfers · refreshes every 15 s</p>
+      </div>
+      <BridgeDepositMonitor
+        deposits={bridge.data?.deposits ?? null}
+        loading={bridge.loading}
+        error={bridge.error}
+      />
     </div>
   );
 }

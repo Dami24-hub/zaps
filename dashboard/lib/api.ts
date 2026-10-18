@@ -105,7 +105,21 @@ export const api = {
 
   // Yield vault aggregate metrics
   yieldStats: () => req<YieldStats>("/admin/vault/stats"),
+
+  // Admin audit trail (Node server)
+  adminLogs: () => serverReq<{ logs: AdminAuditLog[] }>("/api/v1/admin/logs"),
+
+  // Allbridge cross-chain deposits (Node server)
+  bridgeDeposits: (limit = 20) =>
+    serverReq<{ deposits: BridgeDeposit[] }>(
+      `/api/v1/admin/bridge/deposits?limit=${limit}`,
+    ),
 };
+
+/** Backend endpoint exposing raw bridge processing logs for a single deposit. */
+export function bridgeLogUrl(depositId: string): string {
+  return `${SERVER_BASE}/api/v1/admin/bridge/deposits/${encodeURIComponent(depositId)}/logs`;
+}
 
 async function serverReq<T>(path: string, init?: RequestInit): Promise<T> {
   const token =
@@ -255,6 +269,38 @@ export interface ContractAlert {
 
 export interface ContractConfig {
   fee_coefficient: number;
+}
+
+export type AdminAuditAction =
+  | "config_change"
+  | "emergency_pause"
+  | "emergency_unpause"
+  | "role_change"
+  | string;
+
+export interface AdminAuditLog {
+  id: string;
+  action: AdminAuditAction;
+  admin_id: string;
+  admin_email?: string;
+  ip_address: string;
+  /** Changed parameters, e.g. { fee_coefficient: { from: 1, to: 2 } } */
+  changes?: Record<string, unknown>;
+  timestamp: string;
+}
+
+export type BridgeDepositStatus = "pending" | "confirmed" | "failed";
+
+export interface BridgeDeposit {
+  id: string;
+  source_chain: string;
+  target_chain: string;
+  asset: string;
+  amount: string;
+  bridge_tx_hash: string;
+  target_tx_hash?: string;
+  status: BridgeDepositStatus;
+  created_at: string;
 }
 
 export interface YieldStats {
